@@ -14,7 +14,7 @@ mod utils;
 
 use std::io::Write;
 
-use crate::layer::{Embeddings, Llm, OutputProjection, TransformerBlock};
+use crate::layer::{Embeddings, Llm, OutputProjection, TransformerBlock, ParallelBlockGroup};
 use crate::tokenizer::{BpeTokenizer, BpeTokenizerConfig};
 use crate::train::{Dataset, DatasetType};
 
@@ -31,23 +31,32 @@ fn read_line_ascii_trimmed() -> Result<String, String> {
 }
 
 // Build a fresh model whose dimensions match the tokenizer vocab.
-fn build_llm_from_tokenizer(bpe: BpeTokenizer) -> Llm {
+fn build_llm_from_tokenizer(bpe: crate::tokenizer::BpeTokenizer) -> Llm {
     let vocab = bpe.vocab.clone();
 
     let embeddings = Embeddings::new(vocab.clone());
-    let block1 = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
-    let block2 = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
-    let block3 = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
+    let block1 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
 
-    // IMPORTANT: vocab size must match tokenizer vocab size.
-    let out = OutputProjection::new(EMBEDDING_DIM, vocab.words.len());
+    // MTB stage: parallel branches inside one logical layer position.
+    let block2_1 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block2_2 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block2_3 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+    let block2_4 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+
+    let parallel_block2 = ParallelBlockGroup::new(vec![block2_1, block2_2, block2_3, block2_4])
+            .expect("parallel_block_group_new_failed");
+    
+
+    let block3 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+
+    let out = OutputProjection::new(crate::EMBEDDING_DIM, vocab.words.len());
 
     let mut llm = Llm::new(
         vocab,
         vec![
             Box::new(embeddings),
             Box::new(block1),
-            Box::new(block2),
+            Box::new(parallel_block2),
             Box::new(block3),
             Box::new(out),
         ],
@@ -56,9 +65,8 @@ fn build_llm_from_tokenizer(bpe: BpeTokenizer) -> Llm {
     llm.set_bpe_tokenizer(bpe);
     llm.set_residual_dropout_p(0.1);
     llm.set_training(true);
-    if let Err(e) = llm.set_sampling_config(0.9, 40, 0.95, 987654321) {
-        eprintln!("Sampling config failed: {}", e);
-    }
+    let _ = llm.set_sampling_config(0.9, 40, 0.95, 987654321);
+
     llm
 }
 
