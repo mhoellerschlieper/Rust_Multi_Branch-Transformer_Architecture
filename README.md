@@ -2,6 +2,9 @@
 
 Implementation and reference documentation of a **Multi-Branch Transformer Architecture (MBT)** in **Rust**. The focus is on **intra-layer parallelism (width)** with **explicit aggregation**, complemented by a **BPE tokenizer pipeline**, **training/inference**, and **reproducible checkpoints** (tokenizer + parameters) as a closed, analyzable system. The architecture is described to serve as a foundation for **distributed execution** (including P2P topologies) as well as for **fault-tolerant and continuously extensible** transformer systems.
 
+<img width="448" height="692" alt="grafik" src="https://github.com/user-attachments/assets/1ae1d876-6ae2-4246-a80e-1578d7f74722" />
+
+
 ## Contents
 - [Motivation and Objectives](#motivation-and-objectives)
 - [Core Idea: Multi-Branch Transformer (MBT)](#core-idea-multi-branch-transformer-mbt)
@@ -38,6 +41,8 @@ This repository addresses this situation via a **multi-branch topology** in whic
 This aggregation functions as a central system component because it structurally enables **fusion**, **weighting**, **failure handling** (masking/renormalization), and **governance rules** against path impoverishment and weight collapse.
 
 ---
+Result Metrics:
+
 <img width="1228" height="745" alt="grafik" src="https://github.com/user-attachments/assets/2d224c94-1aac-449e-804b-0a957b6774b9" />
 
 ---
@@ -220,6 +225,7 @@ See `LICENSE` in the repository.
 - Related implementations/references (project environment):
   - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
   - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
+
 
 
 
