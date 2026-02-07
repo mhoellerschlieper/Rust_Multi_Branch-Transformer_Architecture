@@ -32,11 +32,8 @@ This repository addresses this situation via a **multi-branch topology** in whic
 
 ## Core Idea: Multi-Branch Transformer (MBT)
 
-An MBT layer contains a set of parallel paths \( \{TB_{l,1}, \dots, TB_{l,K}\} \) that process the same layer input and produce path outputs \( z_i^{(l)} \). The layer output is formed as a weighted aggregation:
+<img width="1226" height="120" alt="grafik" src="https://github.com/user-attachments/assets/811bf50f-780e-4d40-abf4-2083bc8ae2fb" />
 
-\[
-h^{(l+1)} = \sum_{i=1}^{K} \alpha_i^{(l)} \, z_i^{(l)}, \quad \alpha_i^{(l)} \ge 0, \quad \sum_{i=1}^{K} \alpha_i^{(l)} = 1.
-\]
 
 This aggregation functions as a central system component because it structurally enables **fusion**, **weighting**, **failure handling** (masking/renormalization), and **governance rules** against path impoverishment and weight collapse.
 
@@ -223,6 +220,7 @@ See `LICENSE` in the repository.
 - Related implementations/references (project environment):
   - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
   - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
+
 
 
 
