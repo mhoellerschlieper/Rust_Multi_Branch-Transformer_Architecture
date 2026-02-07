@@ -221,6 +221,4 @@ Siehe `LICENSE` im Repository.
   - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
   - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
 
---- 
 
-Wenn die README vollständig an die reale Repository-Struktur (konkrete Modulnamen, CLI-Flags, Pfade, Beispielkommandos, Datenformate, aktuelle Feature-Flags) angepasst werden soll, werden die aktuellen Dateien `Cargo.toml`, `src/`-Baum sowie ggf. vorhandene CLI-Hilfeausgabe benötigt.
