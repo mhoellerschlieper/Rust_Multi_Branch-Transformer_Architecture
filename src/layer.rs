@@ -73,13 +73,17 @@ impl Vocab {
 
 pub trait Layer {
     fn layer_type(&self) -> &str;
+
     fn forward(&mut self, a_input: &Array2<f32>) -> Array2<f32>;
+
     fn backward(&mut self, a_grads: &Array2<f32>, d_lr: f32) -> Array2<f32>;
+
     fn parameters(&self) -> usize;
+
     fn get_parameters_flat(&self) -> Vec<f32>;
+
     fn set_parameters_flat(&mut self, v_params: &[f32]) -> Result<usize, String>;
 
-    // allow optional downcast for model-wide controls (training mode, dropout, etc)
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
         None
     }
@@ -1324,30 +1328,124 @@ impl Layer for MultiHeadSelfAttention {
 }
 
 // ---------------------------
+// TransformerSequence
+// ---------------------------
+// Sequentially applies multiple TransformerBlocks as one logical Layer.
+// Forward:  x -> tb1 -> tb2 -> ... -> out
+// Backward: reverse order backprop through internal blocks.
+//
+// This enables "block sequences" to be used as branches inside ParallelBlockGroup.
+pub struct TransformerSequence {
+    v_blocks: Vec<TransformerBlock>,
+}
+
+impl TransformerSequence {
+    pub fn new(v_blocks: Vec<TransformerBlock>) -> Result<Self, String> {
+        if v_blocks.is_empty() {
+            return Err("transformer_sequence_empty".to_string());
+        }
+        Ok(Self { v_blocks })
+    }
+
+    pub fn set_training(&mut self, b_training: bool) {
+        for tb in self.v_blocks.iter_mut() {
+            tb.set_training(b_training);
+        }
+    }
+
+    pub fn set_residual_dropout_p(&mut self, d_p: f32) {
+        for tb in self.v_blocks.iter_mut() {
+            tb.set_residual_dropout_p(d_p);
+        }
+    }
+
+    pub fn reseed_dropout(&mut self, u64_seed: u64) {
+        for (i_idx, tb) in self.v_blocks.iter_mut().enumerate() {
+            let u64_mix = (i_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            tb.reseed_dropout(u64_seed ^ u64_mix);
+        }
+    }
+}
+
+impl Layer for TransformerSequence {
+    fn layer_type(&self) -> &str {
+        "TransformerSequence"
+    }
+
+    fn forward(&mut self, a_input: &Array2<f32>) -> Array2<f32> {
+        if a_input.nrows() == 0 || a_input.ncols() == 0 {
+            return a_input.clone();
+        }
+
+        let mut a_act = a_input.clone();
+        for tb in self.v_blocks.iter_mut() {
+            a_act = tb.forward(&a_act);
+            if a_act.nrows() == 0 || a_act.ncols() == 0 {
+                return Array2::zeros((0, 0));
+            }
+        }
+        a_act
+    }
+
+    fn backward(&mut self, a_grads: &Array2<f32>, d_lr: f32) -> Array2<f32> {
+        if a_grads.nrows() == 0 || a_grads.ncols() == 0 {
+            return a_grads.clone();
+        }
+
+        let mut a_g = a_grads.clone();
+        for tb in self.v_blocks.iter_mut().rev() {
+            a_g = tb.backward(&a_g, d_lr);
+            if a_g.nrows() == 0 || a_g.ncols() == 0 {
+                return Array2::zeros((0, 0));
+            }
+        }
+        a_g
+    }
+
+    fn parameters(&self) -> usize {
+        self.v_blocks.iter().map(|b| b.parameters()).sum()
+    }
+
+    fn get_parameters_flat(&self) -> Vec<f32> {
+        let mut v: Vec<f32> = Vec::new();
+        for b in self.v_blocks.iter() {
+            v.extend(b.get_parameters_flat());
+        }
+        v
+    }
+
+    fn set_parameters_flat(&mut self, v_params: &[f32]) -> Result<usize, String> {
+        let mut i_used: usize = 0;
+        for b in self.v_blocks.iter_mut() {
+            let i_n = b.set_parameters_flat(&v_params[i_used..])?;
+            i_used = i_used.saturating_add(i_n);
+        }
+        Ok(i_used)
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
+        Some(self)
+    }
+}
+
+// ---------------------------
 // ParallelBlockGroup (MTB)
 // ---------------------------
-// Implements "width" within a layer by executing multiple TransformerBlocks in parallel
-// on the same input and aggregating outputs.
-// This version uses equal weights to keep behavior stable and to prevent path starvation.
-//
-// Forward:
-//   y = (1/k) * sum_i TB_i(x)
-//
-// Backward:
-//   Given dL/dy = g, each branch receives g_i = (1/k) * g
-//   Total dL/dx = sum_i dL/dx_i
+// Generalized to accept branches as Box<dyn Layer>, so that each branch can be
+// - a TransformerBlock
+// - a TransformerSequence
+// - any other future Layer composition
 pub struct ParallelBlockGroup {
-    v_branches: Vec<TransformerBlock>,
+    v_branches: Vec<Box<dyn Layer>>,
     d_equal_weight: f32,
 }
 
 impl ParallelBlockGroup {
-    pub fn new(v_branches: Vec<TransformerBlock>) -> Result<Self, String> {
+    pub fn new(v_branches: Vec<Box<dyn Layer>>) -> Result<Self, String> {
         if v_branches.is_empty() {
             return Err("parallel_block_group_empty".to_string());
         }
-        let i_k = v_branches.len();
-        let d_w = 1.0f32 / (i_k as f32).max(1.0);
+        let d_w = 1.0f32 / (v_branches.len() as f32).max(1.0);
         Ok(Self {
             v_branches,
             d_equal_weight: d_w,
@@ -1355,22 +1453,44 @@ impl ParallelBlockGroup {
     }
 
     pub fn set_training(&mut self, b_training: bool) {
-        for tb in self.v_branches.iter_mut() {
-            tb.set_training(b_training);
+        for br in self.v_branches.iter_mut() {
+            if let Some(tb) = br.as_any_mut().and_then(|a| a.downcast_mut::<TransformerBlock>()) {
+                tb.set_training(b_training);
+                continue;
+            }
+            if let Some(ts) = br.as_any_mut().and_then(|a| a.downcast_mut::<TransformerSequence>()) {
+                ts.set_training(b_training);
+                continue;
+            }
         }
     }
 
     pub fn set_residual_dropout_p(&mut self, d_p: f32) {
-        for tb in self.v_branches.iter_mut() {
-            tb.set_residual_dropout_p(d_p);
+        for br in self.v_branches.iter_mut() {
+            if let Some(tb) = br.as_any_mut().and_then(|a| a.downcast_mut::<TransformerBlock>()) {
+                tb.set_residual_dropout_p(d_p);
+                continue;
+            }
+            if let Some(ts) = br.as_any_mut().and_then(|a| a.downcast_mut::<TransformerSequence>()) {
+                ts.set_residual_dropout_p(d_p);
+                continue;
+            }
         }
     }
 
     pub fn reseed_dropout(&mut self, u64_seed: u64) {
-        // Derive distinct deterministic seeds per branch.
-        for (i_idx, tb) in self.v_branches.iter_mut().enumerate() {
-            let u64_mix = (i_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            tb.reseed_dropout(u64_seed ^ u64_mix);
+        for (i_idx, br) in self.v_branches.iter_mut().enumerate() {
+            let u64_mix = (i_idx as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+            let u64_branch_seed = u64_seed ^ u64_mix;
+
+            if let Some(tb) = br.as_any_mut().and_then(|a| a.downcast_mut::<TransformerBlock>()) {
+                tb.reseed_dropout(u64_branch_seed);
+                continue;
+            }
+            if let Some(ts) = br.as_any_mut().and_then(|a| a.downcast_mut::<TransformerSequence>()) {
+                ts.reseed_dropout(u64_branch_seed);
+                continue;
+            }
         }
     }
 }
@@ -1385,28 +1505,21 @@ impl Layer for ParallelBlockGroup {
             return a_input.clone();
         }
 
-        let i_k = self.v_branches.len();
-        if i_k == 0 {
-            return Array2::zeros((0, 0));
-        }
-
-        // Run each branch on the same input and accumulate.
         let mut a_sum: Option<Array2<f32>> = None;
-        for tb in self.v_branches.iter_mut() {
-            let a_y = tb.forward(a_input);
+
+        for br in self.v_branches.iter_mut() {
+            let a_y = br.forward(a_input);
             if a_y.nrows() == 0 || a_y.ncols() == 0 {
-                // Safe fallback: if one branch fails, ignore it (keeps network running).
                 continue;
             }
+
             match &mut a_sum {
                 None => a_sum = Some(a_y),
                 Some(a_acc) => {
-                    if a_acc.raw_dim() == a_y.raw_dim() {
-                        *a_acc = &*a_acc + &a_y;
-                    } else {
-                        // Shape mismatch should not happen, but handle safely.
+                    if a_acc.raw_dim() != a_y.raw_dim() {
                         return Array2::zeros((0, 0));
                     }
+                    *a_acc = &*a_acc + &a_y;
                 }
             }
         }
@@ -1416,7 +1529,6 @@ impl Layer for ParallelBlockGroup {
             Some(a) => a,
         };
 
-        // Equal weighting.
         let d_w = self.d_equal_weight;
         if d_w.is_finite() && d_w > 0.0 {
             a_out.mapv_inplace(|x| x * d_w);
@@ -1430,27 +1542,19 @@ impl Layer for ParallelBlockGroup {
             return a_grads.clone();
         }
 
-        let i_k = self.v_branches.len();
-        if i_k == 0 {
-            return a_grads.clone();
-        }
-
         let d_w = self.d_equal_weight;
         let mut a_branch_grads = a_grads.clone();
         if d_w.is_finite() && d_w > 0.0 {
             a_branch_grads.mapv_inplace(|x| x * d_w);
         }
 
-        // Each branch gets scaled gradient, and we sum dL/dx across branches.
         let mut a_grad_x_total = Array2::zeros(a_grads.raw_dim());
-        for tb in self.v_branches.iter_mut() {
-            let a_grad_x = tb.backward(&a_branch_grads, d_lr);
-            if a_grad_x.raw_dim() == a_grad_x_total.raw_dim() {
-                a_grad_x_total = a_grad_x_total + a_grad_x;
-            } else {
-                // Safe fallback on mismatch.
+        for br in self.v_branches.iter_mut() {
+            let a_grad_x = br.backward(&a_branch_grads, d_lr);
+            if a_grad_x.raw_dim() != a_grad_x_total.raw_dim() {
                 return a_grads.clone();
             }
+            a_grad_x_total = a_grad_x_total + a_grad_x;
         }
 
         a_grad_x_total
@@ -1472,7 +1576,7 @@ impl Layer for ParallelBlockGroup {
         let mut i_used: usize = 0;
         for b in self.v_branches.iter_mut() {
             let i_n = b.set_parameters_flat(&v_params[i_used..])?;
-            i_used += i_n;
+            i_used = i_used.saturating_add(i_n);
         }
         Ok(i_used)
     }
@@ -1953,17 +2057,24 @@ impl Llm {
         let embeddings = Embeddings::new(vocab.clone());
         let block1 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
 
-        // MTB stage: parallel branches inside one logical layer position.
+        // MTB stage: parallel branches inside one logical layer position, now as sequences.
         let block2_1 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
         let block2_2 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
         let block2_3 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
         let block2_4 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
 
-        let parallel_block2 = ParallelBlockGroup::new(vec![block2_1, block2_2, block2_3, block2_4])
-            .expect("parallel_block_group_new_failed");
+        let seq_2_1 = TransformerSequence::new(vec![block2_1, block2_2])
+            .expect("transformer_sequence_new_failed");
+        let seq_2_2 = TransformerSequence::new(vec![block2_3, block2_4])
+            .expect("transformer_sequence_new_failed");
+
+        let parallel_block2 = ParallelBlockGroup::new(vec![
+            Box::new(seq_2_1) as Box<dyn Layer>,
+            Box::new(seq_2_2) as Box<dyn Layer>,
+        ])
+        .expect("parallel_block_group_new_failed");
 
         let block3 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
-
         let out = OutputProjection::new(crate::EMBEDDING_DIM, vocab.words.len());
 
         let mut llm = Llm::new(

@@ -4,6 +4,8 @@
 // History:
 // - 2026-02-01: Add menu loop and checkpoint save and load.
 // - 2026-02-01: Fix checkpoint load by rebuilding model from checkpoint tokenizer vocab.
+// - 2026-02-07: Add MTB parallel block group layer to support multi branch topology.
+// - 2026-02-07: Add TransformerSequence and generalize ParallelBlockGroup to accept Layer branches.
 // Author: Marcus Schlieper
 
 mod layer;
@@ -14,7 +16,9 @@ mod utils;
 
 use std::io::Write;
 
-use crate::layer::{Embeddings, Llm, OutputProjection, TransformerBlock, ParallelBlockGroup};
+use crate::layer::{
+    Embeddings, Llm, OutputProjection, TransformerBlock, ParallelBlockGroup, TransformerSequence, Layer
+};
 use crate::tokenizer::{BpeTokenizer, BpeTokenizerConfig};
 use crate::train::{Dataset, DatasetType};
 
@@ -37,18 +41,24 @@ fn build_llm_from_tokenizer(bpe: crate::tokenizer::BpeTokenizer) -> Llm {
     let embeddings = Embeddings::new(vocab.clone());
     let block1 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
 
-    // MTB stage: parallel branches inside one logical layer position.
+    // MTB stage: parallel branches inside one logical layer position, now as sequences.
     let block2_1 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
     let block2_2 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
     let block2_3 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
     let block2_4 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
 
-    let parallel_block2 = ParallelBlockGroup::new(vec![block2_1, block2_2, block2_3, block2_4])
-            .expect("parallel_block_group_new_failed");
-    
+    let seq_2_1 = TransformerSequence::new(vec![block2_1, block2_2])
+        .expect("transformer_sequence_new_failed");
+    let seq_2_2 = TransformerSequence::new(vec![block2_3, block2_4])
+        .expect("transformer_sequence_new_failed");
+
+    let parallel_block2 = ParallelBlockGroup::new(vec![
+        Box::new(seq_2_1) as Box<dyn Layer>,
+        Box::new(seq_2_2) as Box<dyn Layer>,
+    ])
+    .expect("parallel_block_group_new_failed");
 
     let block3 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
-
     let out = OutputProjection::new(crate::EMBEDDING_DIM, vocab.words.len());
 
     let mut llm = Llm::new(
@@ -65,8 +75,8 @@ fn build_llm_from_tokenizer(bpe: crate::tokenizer::BpeTokenizer) -> Llm {
     llm.set_bpe_tokenizer(bpe);
     llm.set_residual_dropout_p(0.1);
     llm.set_training(true);
-    let _ = llm.set_sampling_config(0.9, 40, 0.95, 987654321);
 
+    let _ = llm.set_sampling_config(0.9, 40, 0.95, 987654321);
     llm
 }
 
