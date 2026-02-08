@@ -16,7 +16,7 @@ Implementation and reference documentation of a **Multi-Branch Transformer Archi
 - [Training](#training)
 - [Inference](#inference)
 - [Checkpoints and Reproducibility](#checkpoints-and-reproducibility)
-- [Benchmark](#Benchmark)
+- [Benchmark with and without outage simulation](#Benchmark with and without outage simulation)
 - [Topology(Example)](#Topology)
 - [Distributed Execution and Fault Tolerance (Concept)](#distributed-execution-and-fault-tolerance-concept)
 - [Security and Robustness (System Perspective)](#security-and-robustness-system-perspective)
@@ -148,7 +148,7 @@ When saving, an atomic write strategy (temporary file + rename) is used to avoid
 <img width="508" height="256" alt="grafik" src="https://github.com/user-attachments/assets/c478ee5b-5f2d-43aa-b994-b6246ac1fd5f" />
 
 ---
-## Benchmark with and without outark simulation
+## Benchmark with and without outage simulation
 <img width="738" height="846" alt="grafik" src="https://github.com/user-attachments/assets/f2ab349c-0ca2-413d-9b10-3e9a1f47b100" />
 
 ---
@@ -236,6 +236,7 @@ See `LICENSE` in the repository.
 - Related implementations/references (project environment):
   - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
   - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
+
 
 
 
