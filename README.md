@@ -16,7 +16,7 @@ Implementation and reference documentation of a **Multi-Branch Transformer Archi
 - [Training](#training)
 - [Inference](#inference)
 - [Checkpoints and Reproducibility](#checkpoints-and-reproducibility)
-- [Benchmark with and without outage simulation](#Benchmark with and without outage simulation)
+- [Benchmark with and without outage simulation](#Benchmark)
 - [Topology(Example)](#Topology)
 - [Distributed Execution and Fault Tolerance (Concept)](#distributed-execution-and-fault-tolerance-concept)
 - [Security and Robustness (System Perspective)](#security-and-robustness-system-perspective)
@@ -236,6 +236,7 @@ See `LICENSE` in the repository.
 - Related implementations/references (project environment):
   - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
   - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
+
 
 
 
