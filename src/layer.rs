@@ -2141,16 +2141,20 @@ pub enum TrainingDataEventAscii {
 
 #[derive(Clone, Debug)]
 struct online_data_ingestion_state_ascii {
-    // Safety limits.
     i_max_file_bytes: usize,
     i_max_rows_per_event: usize,
     i_max_total_rows: usize,
 
-    // Diagnostics.
     i_total_rows_added: usize,
     i_total_events_processed: usize,
     i_total_parse_errors: usize,
     i_total_rows_rejected: usize,
+
+    // New: pending queue proxy, window stats.
+    i_pending_events_observed_peak: usize,
+    u64_window_start_ms: u64,
+    i_rows_added_window: usize,
+    i_events_processed_window: usize,
 }
 
 impl online_data_ingestion_state_ascii {
@@ -2164,9 +2168,15 @@ impl online_data_ingestion_state_ascii {
             i_total_events_processed: 0,
             i_total_parse_errors: 0,
             i_total_rows_rejected: 0,
+
+            i_pending_events_observed_peak: 0,
+            u64_window_start_ms: 0,
+            i_rows_added_window: 0,
+            i_events_processed_window: 0,
         }
     }
 }
+
 
 fn read_json_array_of_strings_file_ascii(
     s_path: &str,
@@ -2242,19 +2252,64 @@ fn append_tokenized_rows_ascii(
         st_ing.i_total_rows_added = st_ing.i_total_rows_added.saturating_add(1);
     }
 }
+fn now_ms_ascii() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/* ------------------------------ Helpers for drift proxy ------------------------------ */
+
+fn logits_distance_l2_ascii(a_a: &Array2<f32>, a_b: &Array2<f32>) -> f32 {
+    if a_a.raw_dim() != a_b.raw_dim() || a_a.len() == 0 {
+        return 0.0;
+    }
+    let mut d_sum: f32 = 0.0;
+    for (x, y) in a_a.iter().zip(a_b.iter()) {
+        let dx = math::sanitize_f32(*x);
+        let dy = math::sanitize_f32(*y);
+        let d = dx - dy;
+        d_sum += d * d;
+    }
+    math::sanitize_f32(d_sum.sqrt())
+}
+
+fn logits_cosine_distance_ascii(a_a: &Array2<f32>, a_b: &Array2<f32>) -> f32 {
+    if a_a.raw_dim() != a_b.raw_dim() || a_a.len() == 0 {
+        return 0.0;
+    }
+    let v_a: Vec<f32> = a_a.iter().map(|&d| math::sanitize_f32(d)).collect();
+    let v_b: Vec<f32> = a_b.iter().map(|&d| math::sanitize_f32(d)).collect();
+    let d_cos = math::cosine_similarity_f32(&v_a, &v_b);
+    math::sanitize_f32(1.0 - d_cos)
+}
 
 fn drain_training_data_events_non_blocking_ascii(
     llm: &Llm,
     opt_rx: &mut Option<Receiver<TrainingDataEventAscii>>,
     v_tokenized_data: &mut Vec<Vec<usize>>,
     st_ing: &mut online_data_ingestion_state_ascii,
+    met_ing: &mut ingestion_metrics_ascii,
 ) {
     let rx = match opt_rx.as_mut() {
         Some(v) => v,
         None => return,
     };
 
+    let u64_t0 = now_ms_ascii();
+    if st_ing.u64_window_start_ms == 0 {
+        st_ing.u64_window_start_ms = u64_t0;
+    }
+
+    // Queue proxy: drain until empty; count how many drain batches happen.
+    let mut i_local_batches: usize = 0;
+    let mut i_pending_probe: usize = 0;
+
     loop {
+        // Approximate pending count by repeated try_recv attempts; not exact but a proxy.
+        i_pending_probe = i_pending_probe.saturating_add(1);
         let ev = match rx.try_recv() {
             Ok(v) => v,
             Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -2264,7 +2319,10 @@ fn drain_training_data_events_non_blocking_ascii(
             }
         };
 
+        i_local_batches = i_local_batches.saturating_add(1);
+
         st_ing.i_total_events_processed = st_ing.i_total_events_processed.saturating_add(1);
+        st_ing.i_events_processed_window = st_ing.i_events_processed_window.saturating_add(1);
 
         match ev {
             TrainingDataEventAscii::shutdown => {
@@ -2272,15 +2330,57 @@ fn drain_training_data_events_non_blocking_ascii(
                 break;
             }
             TrainingDataEventAscii::add_training_rows { v_rows } => {
+                let i_before = st_ing.i_total_rows_added;
                 append_tokenized_rows_ascii(llm, v_tokenized_data, &v_rows, st_ing);
+                let i_after = st_ing.i_total_rows_added;
+                st_ing.i_rows_added_window = st_ing
+                    .i_rows_added_window
+                    .saturating_add(i_after.saturating_sub(i_before));
             }
             TrainingDataEventAscii::add_training_file_json_array { s_path } => {
                 match read_json_array_of_strings_file_ascii(&s_path, st_ing.i_max_file_bytes) {
-                    Ok(v_rows) => append_tokenized_rows_ascii(llm, v_tokenized_data, &v_rows, st_ing),
+                    Ok(v_rows) => {
+                        let i_before = st_ing.i_total_rows_added;
+                        append_tokenized_rows_ascii(llm, v_tokenized_data, &v_rows, st_ing);
+                        let i_after = st_ing.i_total_rows_added;
+                        st_ing.i_rows_added_window = st_ing
+                            .i_rows_added_window
+                            .saturating_add(i_after.saturating_sub(i_before));
+                    }
                     Err(_) => st_ing.i_total_parse_errors = st_ing.i_total_parse_errors.saturating_add(1),
                 }
             }
         }
+    }
+
+    st_ing.i_pending_events_observed_peak = st_ing.i_pending_events_observed_peak.max(i_pending_probe);
+
+    // Export ingestion metrics snapshot each drain call (windowed rates).
+    let u64_t1 = now_ms_ascii();
+    let d_dt = ((u64_t1.saturating_sub(st_ing.u64_window_start_ms)) as f32) / 1000.0;
+    let d_dt_safe = d_dt.max(1e-6);
+
+    met_ing.i_events_processed_total = st_ing.i_total_events_processed;
+    met_ing.i_rows_added_total = st_ing.i_total_rows_added;
+    met_ing.i_rows_rejected_total = st_ing.i_total_rows_rejected;
+    met_ing.i_parse_errors_total = st_ing.i_total_parse_errors;
+
+    met_ing.i_rows_added_window = st_ing.i_rows_added_window;
+    met_ing.i_events_processed_window = st_ing.i_events_processed_window;
+    met_ing.u64_window_start_ms = st_ing.u64_window_start_ms;
+    met_ing.u64_window_end_ms = u64_t1;
+
+    met_ing.d_rows_per_sec_window = (st_ing.i_rows_added_window as f32) / d_dt_safe;
+    met_ing.d_events_per_sec_window = (st_ing.i_events_processed_window as f32) / d_dt_safe;
+
+    met_ing.i_pending_events_observed_peak = met_ing.i_pending_events_observed_peak.max(st_ing.i_pending_events_observed_peak);
+    met_ing.i_last_drain_batches = i_local_batches;
+
+    // Reset window if it grows too large.
+    if d_dt > 5.0 {
+        st_ing.u64_window_start_ms = u64_t1;
+        st_ing.i_rows_added_window = 0;
+        st_ing.i_events_processed_window = 0;
     }
 }
 
@@ -2546,6 +2646,501 @@ impl PredictStats {
         }
     }
 }
+/* ------------------------------ Metrics structs ------------------------------ */
+
+#[derive(Clone, Debug)]
+pub struct ingestion_metrics_ascii {
+    // Throughput and queue states.
+    pub i_events_processed_total: usize,
+    pub i_rows_added_total: usize,
+    pub i_rows_rejected_total: usize,
+    pub i_parse_errors_total: usize,
+
+    // Derived rates and last window info.
+    pub d_rows_per_sec_window: f32,
+    pub d_events_per_sec_window: f32,
+    pub i_rows_added_window: usize,
+    pub i_events_processed_window: usize,
+    pub u64_window_start_ms: u64,
+    pub u64_window_end_ms: u64,
+
+    // Queue proxy counters.
+    pub i_pending_events_observed_peak: usize,
+    pub i_last_drain_batches: usize,
+}
+
+impl ingestion_metrics_ascii {
+    pub fn new() -> Self {
+        Self {
+            i_events_processed_total: 0,
+            i_rows_added_total: 0,
+            i_rows_rejected_total: 0,
+            i_parse_errors_total: 0,
+            d_rows_per_sec_window: 0.0,
+            d_events_per_sec_window: 0.0,
+            i_rows_added_window: 0,
+            i_events_processed_window: 0,
+            u64_window_start_ms: 0,
+            u64_window_end_ms: 0,
+            i_pending_events_observed_peak: 0,
+            i_last_drain_batches: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct coverage_metrics_ascii {
+    pub i_epoch_token_rows_start: usize,
+    pub i_epoch_token_rows_end: usize,
+    pub i_epoch_rows_used: usize,
+    pub d_coverage_ratio_used_over_available: f32,
+    pub d_new_data_ratio_in_available: f32,
+    pub i_new_rows_added_during_epoch: usize,
+}
+
+impl coverage_metrics_ascii {
+    pub fn new() -> Self {
+        Self {
+            i_epoch_token_rows_start: 0,
+            i_epoch_token_rows_end: 0,
+            i_epoch_rows_used: 0,
+            d_coverage_ratio_used_over_available: 0.0,
+            d_new_data_ratio_in_available: 0.0,
+            i_new_rows_added_during_epoch: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct mask_participation_metrics_ascii {
+    pub i_steps_observed: usize,
+    pub i_active_branches_min: usize,
+    pub i_active_branches_max: usize,
+    pub d_active_branches_mean: f32,
+    pub d_active_branches_m2: f32, // Welford variance helper.
+    pub i_steps_at_min_active: usize,
+
+    pub d_mask_sparsity_mean: f32, // fraction inactive.
+    pub d_mask_sparsity_m2: f32,
+}
+
+impl mask_participation_metrics_ascii {
+    pub fn new() -> Self {
+        Self {
+            i_steps_observed: 0,
+            i_active_branches_min: usize::MAX,
+            i_active_branches_max: 0,
+            d_active_branches_mean: 0.0,
+            d_active_branches_m2: 0.0,
+            i_steps_at_min_active: 0,
+            d_mask_sparsity_mean: 0.0,
+            d_mask_sparsity_m2: 0.0,
+        }
+    }
+
+    pub fn update(&mut self, i_active: usize, i_total: usize, i_min_active: usize) {
+        if i_total == 0 {
+            return;
+        }
+
+        let d_sparsity = 1.0 - (i_active as f32) / (i_total as f32).max(1.0);
+
+        self.i_steps_observed = self.i_steps_observed.saturating_add(1);
+        self.i_active_branches_min = self.i_active_branches_min.min(i_active);
+        self.i_active_branches_max = self.i_active_branches_max.max(i_active);
+
+        if i_active == i_min_active {
+            self.i_steps_at_min_active = self.i_steps_at_min_active.saturating_add(1);
+        }
+
+        // Welford mean/variance for active branches.
+        let d_x = i_active as f32;
+        let d_n = self.i_steps_observed as f32;
+        let d_delta = d_x - self.d_active_branches_mean;
+        self.d_active_branches_mean += d_delta / d_n.max(1.0);
+        let d_delta2 = d_x - self.d_active_branches_mean;
+        self.d_active_branches_m2 += d_delta * d_delta2;
+
+        // Welford for sparsity.
+        let d_y = d_sparsity;
+        let d_delta_s = d_y - self.d_mask_sparsity_mean;
+        self.d_mask_sparsity_mean += d_delta_s / d_n.max(1.0);
+        let d_delta_s2 = d_y - self.d_mask_sparsity_mean;
+        self.d_mask_sparsity_m2 += d_delta_s * d_delta_s2;
+    }
+
+    pub fn active_branches_std(&self) -> f32 {
+        if self.i_steps_observed < 2 {
+            return 0.0;
+        }
+        let d_var = self.d_active_branches_m2 / ((self.i_steps_observed - 1) as f32).max(1.0);
+        math::sanitize_f32(d_var).sqrt()
+    }
+
+    pub fn sparsity_std(&self) -> f32 {
+        if self.i_steps_observed < 2 {
+            return 0.0;
+        }
+        let d_var = self.d_mask_sparsity_m2 / ((self.i_steps_observed - 1) as f32).max(1.0);
+        math::sanitize_f32(d_var).sqrt()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct inverse_participation_scaling_metrics_ascii {
+    // Proxy: compare grad norm with scaling vs without scaling for same mask and same row.
+    pub i_samples: usize,
+    pub d_grad_norm_ratio_mean: f32,
+    pub d_grad_norm_ratio_m2: f32,
+    pub d_grad_norm_scaled_mean: f32,
+    pub d_grad_norm_unscaled_mean: f32,
+}
+
+impl inverse_participation_scaling_metrics_ascii {
+    pub fn new() -> Self {
+        Self {
+            i_samples: 0,
+            d_grad_norm_ratio_mean: 0.0,
+            d_grad_norm_ratio_m2: 0.0,
+            d_grad_norm_scaled_mean: 0.0,
+            d_grad_norm_unscaled_mean: 0.0,
+        }
+    }
+
+    pub fn update(&mut self, d_scaled: f32, d_unscaled: f32) {
+        if !d_scaled.is_finite() || !d_unscaled.is_finite() || d_unscaled <= 1e-12 {
+            return;
+        }
+        let d_ratio = d_scaled / d_unscaled;
+
+        self.i_samples = self.i_samples.saturating_add(1);
+        let d_n = self.i_samples as f32;
+
+        // Ratio Welford.
+        let d_delta = d_ratio - self.d_grad_norm_ratio_mean;
+        self.d_grad_norm_ratio_mean += d_delta / d_n.max(1.0);
+        let d_delta2 = d_ratio - self.d_grad_norm_ratio_mean;
+        self.d_grad_norm_ratio_m2 += d_delta * d_delta2;
+
+        // Means.
+        self.d_grad_norm_scaled_mean += (d_scaled - self.d_grad_norm_scaled_mean) / d_n.max(1.0);
+        self.d_grad_norm_unscaled_mean += (d_unscaled - self.d_grad_norm_unscaled_mean) / d_n.max(1.0);
+    }
+
+    pub fn ratio_std(&self) -> f32 {
+        if self.i_samples < 2 {
+            return 0.0;
+        }
+        let d_var = self.d_grad_norm_ratio_m2 / ((self.i_samples - 1) as f32).max(1.0);
+        math::sanitize_f32(d_var).sqrt()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct replay_metrics_ascii {
+    pub i_replay_steps_total: usize,
+    pub i_fresh_steps_total: usize,
+    pub d_replay_p_last: f32,
+
+    // Effect strength proxy:
+    // delta_loss = loss_replay - loss_fresh (positive means replay is worse).
+    pub i_pairs: usize,
+    pub d_delta_loss_mean: f32,
+    pub d_delta_loss_m2: f32,
+}
+
+impl replay_metrics_ascii {
+    pub fn new() -> Self {
+        Self {
+            i_replay_steps_total: 0,
+            i_fresh_steps_total: 0,
+            d_replay_p_last: 0.0,
+            i_pairs: 0,
+            d_delta_loss_mean: 0.0,
+            d_delta_loss_m2: 0.0,
+        }
+    }
+
+    pub fn inc_fresh(&mut self) {
+        self.i_fresh_steps_total = self.i_fresh_steps_total.saturating_add(1);
+    }
+
+    pub fn inc_replay(&mut self) {
+        self.i_replay_steps_total = self.i_replay_steps_total.saturating_add(1);
+    }
+
+    pub fn update_delta_loss(&mut self, d_loss_fresh: f32, d_loss_replay: f32) {
+        if !d_loss_fresh.is_finite() || !d_loss_replay.is_finite() {
+            return;
+        }
+        let d_delta = d_loss_replay - d_loss_fresh;
+        self.i_pairs = self.i_pairs.saturating_add(1);
+        let d_n = self.i_pairs as f32;
+
+        let d_d1 = d_delta - self.d_delta_loss_mean;
+        self.d_delta_loss_mean += d_d1 / d_n.max(1.0);
+        let d_d2 = d_delta - self.d_delta_loss_mean;
+        self.d_delta_loss_m2 += d_d1 * d_d2;
+    }
+
+    pub fn delta_loss_std(&self) -> f32 {
+        if self.i_pairs < 2 {
+            return 0.0;
+        }
+        let d_var = self.d_delta_loss_m2 / ((self.i_pairs - 1) as f32).max(1.0);
+        math::sanitize_f32(d_var).sqrt()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct retention_metrics_ascii {
+    // Fixed control sets evaluation.
+    pub d_loss_control_old: f32,
+    pub d_loss_control_new: f32,
+    pub d_retention_delta_old: f32,
+    pub d_retention_delta_new: f32,
+    pub u64_last_eval_ms: u64,
+}
+
+impl retention_metrics_ascii {
+    pub fn new() -> Self {
+        Self {
+            d_loss_control_old: 0.0,
+            d_loss_control_new: 0.0,
+            d_retention_delta_old: 0.0,
+            d_retention_delta_new: 0.0,
+            u64_last_eval_ms: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct branch_fairness_metrics_ascii {
+    // Selection and dominance.
+    pub v_selected_count: Vec<usize>,
+    pub i_total_selections: usize,
+    pub d_gini_selected: f32,
+    pub d_top1_share_selected: f32,
+    pub i_starvation_steps_max: usize,
+}
+
+impl branch_fairness_metrics_ascii {
+    pub fn new(i_k: usize) -> Self {
+        Self {
+            v_selected_count: vec![0; i_k.max(1)],
+            i_total_selections: 0,
+            d_gini_selected: 0.0,
+            d_top1_share_selected: 0.0,
+            i_starvation_steps_max: 0,
+        }
+    }
+
+    pub fn ensure_len(&mut self, i_k: usize) {
+        if self.v_selected_count.len() != i_k {
+            self.v_selected_count = vec![0; i_k.max(1)];
+            self.i_total_selections = 0;
+            self.d_gini_selected = 0.0;
+            self.d_top1_share_selected = 0.0;
+            self.i_starvation_steps_max = 0;
+        }
+    }
+
+    pub fn on_select(&mut self, i_branch: usize) {
+        if i_branch >= self.v_selected_count.len() {
+            return;
+        }
+        self.v_selected_count[i_branch] = self.v_selected_count[i_branch].saturating_add(1);
+        self.i_total_selections = self.i_total_selections.saturating_add(1);
+    }
+
+    pub fn recompute(&mut self) {
+        if self.v_selected_count.is_empty() {
+            return;
+        }
+        let d_sum: f32 = self.v_selected_count.iter().map(|&c| c as f32).sum();
+        if d_sum <= 0.0 || !d_sum.is_finite() {
+            self.d_gini_selected = 0.0;
+            self.d_top1_share_selected = 0.0;
+            return;
+        }
+        let v_p: Vec<f32> = self.v_selected_count.iter().map(|&c| (c as f32) / d_sum).collect();
+        self.d_gini_selected = math::gini_coefficient_f32(&v_p);
+
+        let mut v_sorted = v_p.clone();
+        v_sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
+        self.d_top1_share_selected = *v_sorted.get(0).unwrap_or(&0.0);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct snapshot_metrics_ascii {
+    pub i_snapshots_sent_total: usize,
+    pub i_snapshots_applied_total: usize,
+
+    // Latency and staleness.
+    pub d_latency_ms_last: f32,
+    pub d_latency_ms_mean: f32,
+    pub d_latency_ms_m2: f32,
+    pub i_latency_samples: usize,
+
+    pub i_staleness_steps_last: usize,
+    pub d_staleness_steps_mean: f32,
+    pub d_staleness_steps_m2: f32,
+    pub i_staleness_samples: usize,
+
+    // Producer tracking.
+    pub i_train_step_last_sent: usize,
+    pub u64_last_send_ms: u64,
+}
+
+impl snapshot_metrics_ascii {
+    pub fn new() -> Self {
+        Self {
+            i_snapshots_sent_total: 0,
+            i_snapshots_applied_total: 0,
+            d_latency_ms_last: 0.0,
+            d_latency_ms_mean: 0.0,
+            d_latency_ms_m2: 0.0,
+            i_latency_samples: 0,
+            i_staleness_steps_last: 0,
+            d_staleness_steps_mean: 0.0,
+            d_staleness_steps_m2: 0.0,
+            i_staleness_samples: 0,
+            i_train_step_last_sent: 0,
+            u64_last_send_ms: 0,
+        }
+    }
+
+    pub fn on_send(&mut self, i_train_step: usize, u64_now_ms: u64) {
+        self.i_snapshots_sent_total = self.i_snapshots_sent_total.saturating_add(1);
+        self.i_train_step_last_sent = i_train_step;
+        self.u64_last_send_ms = u64_now_ms;
+    }
+
+    pub fn on_apply(&mut self, u64_apply_ms: u64, i_train_step_now: usize, i_snapshot_step: usize) {
+        self.i_snapshots_applied_total = self.i_snapshots_applied_total.saturating_add(1);
+
+        // Latency in ms between send and apply if send timestamp exists.
+        if self.u64_last_send_ms > 0 && u64_apply_ms >= self.u64_last_send_ms {
+            let d_lat = (u64_apply_ms - self.u64_last_send_ms) as f32;
+            if d_lat.is_finite() {
+                self.d_latency_ms_last = d_lat;
+                self.i_latency_samples = self.i_latency_samples.saturating_add(1);
+                let d_n = self.i_latency_samples as f32;
+                let d_delta = d_lat - self.d_latency_ms_mean;
+                self.d_latency_ms_mean += d_delta / d_n.max(1.0);
+                let d_delta2 = d_lat - self.d_latency_ms_mean;
+                self.d_latency_ms_m2 += d_delta * d_delta2;
+            }
+        }
+
+        // Staleness in steps at time of apply.
+        let i_stale = i_train_step_now.saturating_sub(i_snapshot_step);
+        self.i_staleness_steps_last = i_stale;
+        self.i_staleness_samples = self.i_staleness_samples.saturating_add(1);
+        let d_n2 = self.i_staleness_samples as f32;
+        let d_x = i_stale as f32;
+        let d_delta_s = d_x - self.d_staleness_steps_mean;
+        self.d_staleness_steps_mean += d_delta_s / d_n2.max(1.0);
+        let d_delta_s2 = d_x - self.d_staleness_steps_mean;
+        self.d_staleness_steps_m2 += d_delta_s * d_delta_s2;
+    }
+
+    pub fn latency_std(&self) -> f32 {
+        if self.i_latency_samples < 2 {
+            return 0.0;
+        }
+        let d_var = self.d_latency_ms_m2 / ((self.i_latency_samples - 1) as f32).max(1.0);
+        math::sanitize_f32(d_var).sqrt()
+    }
+
+    pub fn staleness_std(&self) -> f32 {
+        if self.i_staleness_samples < 2 {
+            return 0.0;
+        }
+        let d_var = self.d_staleness_steps_m2 / ((self.i_staleness_samples - 1) as f32).max(1.0);
+        math::sanitize_f32(d_var).sqrt()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct expansion_metrics_ascii {
+    pub i_expansion_events_total: usize,
+    pub i_branches_before_last: usize,
+    pub i_branches_after_last: usize,
+    pub d_eta_injection_last: f32,
+    pub d_sum_w_new_last: f32,
+    pub u64_last_event_ms: u64,
+}
+
+impl expansion_metrics_ascii {
+    pub fn new() -> Self {
+        Self {
+            i_expansion_events_total: 0,
+            i_branches_before_last: 0,
+            i_branches_after_last: 0,
+            d_eta_injection_last: 0.0,
+            d_sum_w_new_last: 0.0,
+            u64_last_event_ms: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct drift_metrics_ascii {
+    // Proxy distances between model logits before and after expansion.
+    pub i_drift_samples_total: usize,
+    pub d_logits_l2_mean: f32,
+    pub d_logits_l2_m2: f32,
+    pub d_logits_cos_dist_mean: f32,
+    pub d_logits_cos_dist_m2: f32,
+}
+
+impl drift_metrics_ascii {
+    pub fn new() -> Self {
+        Self {
+            i_drift_samples_total: 0,
+            d_logits_l2_mean: 0.0,
+            d_logits_l2_m2: 0.0,
+            d_logits_cos_dist_mean: 0.0,
+            d_logits_cos_dist_m2: 0.0,
+        }
+    }
+
+    pub fn update(&mut self, d_l2: f32, d_cos_dist: f32) {
+        if !d_l2.is_finite() || !d_cos_dist.is_finite() {
+            return;
+        }
+        self.i_drift_samples_total = self.i_drift_samples_total.saturating_add(1);
+        let d_n = self.i_drift_samples_total as f32;
+
+        let d_dl = d_l2 - self.d_logits_l2_mean;
+        self.d_logits_l2_mean += d_dl / d_n.max(1.0);
+        let d_dl2 = d_l2 - self.d_logits_l2_mean;
+        self.d_logits_l2_m2 += d_dl * d_dl2;
+
+        let d_dc = d_cos_dist - self.d_logits_cos_dist_mean;
+        self.d_logits_cos_dist_mean += d_dc / d_n.max(1.0);
+        let d_dc2 = d_cos_dist - self.d_logits_cos_dist_mean;
+        self.d_logits_cos_dist_m2 += d_dc * d_dc2;
+    }
+
+    pub fn l2_std(&self) -> f32 {
+        if self.i_drift_samples_total < 2 {
+            return 0.0;
+        }
+        let d_var = self.d_logits_l2_m2 / ((self.i_drift_samples_total - 1) as f32).max(1.0);
+        math::sanitize_f32(d_var).sqrt()
+    }
+
+    pub fn cos_dist_std(&self) -> f32 {
+        if self.i_drift_samples_total < 2 {
+            return 0.0;
+        }
+        let d_var = self.d_logits_cos_dist_m2 / ((self.i_drift_samples_total - 1) as f32).max(1.0);
+        math::sanitize_f32(d_var).sqrt()
+    }
+}
 
 // -----------------------------
 // Background training support
@@ -2561,11 +3156,85 @@ pub struct TrainingProgressEventAscii {
     pub i_rows_used_last_epoch: usize,
     pub i_total_steps: usize,
 
-    // Diagnostics (new):
     pub i_skips_empty_act: usize,
     pub i_skips_empty_logits: usize,
     pub i_skips_pg_downcast_failed: usize,
     pub i_skips_pg_no_branches: usize,
+
+    // ---- New metrics: keep ASCII names ----
+
+    // 1) Ingestion throughput and queue proxy.
+    pub d_ingest_rows_per_sec_window: f32,
+    pub d_ingest_events_per_sec_window: f32,
+    pub i_ingest_rows_added_total: usize,
+    pub i_ingest_events_processed_total: usize,
+    pub i_ingest_parse_errors_total: usize,
+    pub i_ingest_rows_rejected_total: usize,
+    pub i_ingest_pending_events_observed_peak: usize,
+
+    // 2) Coverage ratio.
+    pub d_coverage_ratio_used_over_available: f32,
+    pub d_new_data_ratio_in_available: f32,
+    pub i_new_rows_added_during_epoch: usize,
+    pub i_epoch_token_rows_start: usize,
+    pub i_epoch_token_rows_end: usize,
+
+    // 3) Mask participation stats.
+    pub d_active_branches_mean: f32,
+    pub d_active_branches_std: f32,
+    pub i_active_branches_min: usize,
+    pub i_active_branches_max: usize,
+    pub d_mask_sparsity_mean: f32,
+    pub d_mask_sparsity_std: f32,
+    pub d_steps_at_min_active_share: f32,
+
+    // 4) Inverse participation scaling impact.
+    pub d_grad_norm_ratio_scaled_over_unscaled_mean: f32,
+    pub d_grad_norm_ratio_scaled_over_unscaled_std: f32,
+    pub d_grad_norm_scaled_mean: f32,
+    pub d_grad_norm_unscaled_mean: f32,
+
+    // 5) Replay usage and effect.
+    pub d_replay_share: f32,
+    pub d_replay_p_last: f32,
+    pub d_replay_delta_loss_mean: f32,
+    pub d_replay_delta_loss_std: f32,
+
+    // 6) Retention score on fixed control sets.
+    pub d_loss_control_old: f32,
+    pub d_loss_control_new: f32,
+    pub d_retention_delta_old: f32,
+    pub d_retention_delta_new: f32,
+
+    // 7) Branch selection fairness.
+    pub d_branch_select_gini: f32,
+    pub d_branch_select_top1_share: f32,
+
+    // 8) Snapshot latency and staleness.
+    pub d_snapshot_latency_ms_last: f32,
+    pub d_snapshot_latency_ms_mean: f32,
+    pub d_snapshot_latency_ms_std: f32,
+    pub i_snapshot_staleness_steps_last: usize,
+    pub d_snapshot_staleness_steps_mean: f32,
+    pub d_snapshot_staleness_steps_std: f32,
+    pub i_snapshots_sent_total: usize,
+
+    // 9) Expansion telemetry.
+    pub i_expansion_events_total: usize,
+    pub i_branches_before_last_expand: usize,
+    pub i_branches_after_last_expand: usize,
+    pub d_eta_injection_last: f32,
+    pub d_sum_w_new_last: f32,
+
+    // 10) Output drift bound proxy.
+    pub d_expand_drift_logits_l2_mean: f32,
+    pub d_expand_drift_logits_l2_std: f32,
+    pub d_expand_drift_logits_cos_dist_mean: f32,
+    pub d_expand_drift_logits_cos_dist_std: f32,
+
+    // EMA state.
+    pub b_ema_active: bool,
+    pub i_ema_last_selected_branch: isize,
 }
 impl TrainingProgressEventAscii {
     pub fn new_basic(
@@ -2585,13 +3254,78 @@ impl TrainingProgressEventAscii {
             d_last_step_loss,
             i_rows_used_last_epoch,
             i_total_steps,
+
             i_skips_empty_act: 0,
             i_skips_empty_logits: 0,
             i_skips_pg_downcast_failed: 0,
             i_skips_pg_no_branches: 0,
+
+            d_ingest_rows_per_sec_window: 0.0,
+            d_ingest_events_per_sec_window: 0.0,
+            i_ingest_rows_added_total: 0,
+            i_ingest_events_processed_total: 0,
+            i_ingest_parse_errors_total: 0,
+            i_ingest_rows_rejected_total: 0,
+            i_ingest_pending_events_observed_peak: 0,
+
+            d_coverage_ratio_used_over_available: 0.0,
+            d_new_data_ratio_in_available: 0.0,
+            i_new_rows_added_during_epoch: 0,
+            i_epoch_token_rows_start: 0,
+            i_epoch_token_rows_end: 0,
+
+            d_active_branches_mean: 0.0,
+            d_active_branches_std: 0.0,
+            i_active_branches_min: 0,
+            i_active_branches_max: 0,
+            d_mask_sparsity_mean: 0.0,
+            d_mask_sparsity_std: 0.0,
+            d_steps_at_min_active_share: 0.0,
+
+            d_grad_norm_ratio_scaled_over_unscaled_mean: 0.0,
+            d_grad_norm_ratio_scaled_over_unscaled_std: 0.0,
+            d_grad_norm_scaled_mean: 0.0,
+            d_grad_norm_unscaled_mean: 0.0,
+
+            d_replay_share: 0.0,
+            d_replay_p_last: 0.0,
+            d_replay_delta_loss_mean: 0.0,
+            d_replay_delta_loss_std: 0.0,
+
+            d_loss_control_old: 0.0,
+            d_loss_control_new: 0.0,
+            d_retention_delta_old: 0.0,
+            d_retention_delta_new: 0.0,
+
+            d_branch_select_gini: 0.0,
+            d_branch_select_top1_share: 0.0,
+
+            d_snapshot_latency_ms_last: 0.0,
+            d_snapshot_latency_ms_mean: 0.0,
+            d_snapshot_latency_ms_std: 0.0,
+            i_snapshot_staleness_steps_last: 0,
+            d_snapshot_staleness_steps_mean: 0.0,
+            d_snapshot_staleness_steps_std: 0.0,
+            i_snapshots_sent_total: 0,
+
+            i_expansion_events_total: 0,
+            i_branches_before_last_expand: 0,
+            i_branches_after_last_expand: 0,
+            d_eta_injection_last: 0.0,
+            d_sum_w_new_last: 0.0,
+
+            d_expand_drift_logits_l2_mean: 0.0,
+            d_expand_drift_logits_l2_std: 0.0,
+            d_expand_drift_logits_cos_dist_mean: 0.0,
+            d_expand_drift_logits_cos_dist_std: 0.0,
+
+            b_ema_active: false,
+            i_ema_last_selected_branch: -1,
         }
     }
 }
+
+
 
 // -----------------------------
 // Continuous learning config
@@ -3434,7 +4168,7 @@ impl Llm {
         v_data: Vec<&str>,
         i_epochs: usize,
         d_lr: f32,
-        b_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        b_cancel: std::sync::Arc<AtomicBool>,
         tx_progress: Sender<TrainingProgressEventAscii>,
         s_phase: &str,
         opt_cl: Option<ContinuousLearningConfig>,
@@ -3444,7 +4178,7 @@ impl Llm {
         opt_data_rx: &mut Option<Receiver<TrainingDataEventAscii>>,
     ) -> Result<(), String> {
         // History:
-        // - 2026-02-14: Online ingestion receiver is borrowed mutably and remains alive across phases.
+        // - 2026-02-15: Add advanced validation metrics emission for continuous learning and expansion.
 
         cfg_phase.validate()?;
         self.set_training(true);
@@ -3466,7 +4200,7 @@ impl Llm {
         let mut v_tokenized_data: Vec<Vec<usize>> = v_data
             .iter()
             .map(|s| self.tokenize(s))
-            .collect::<Result<Vec<Vec<usize>>, String>>()?
+            .collect::<Result<Vec<_>, String>>()?
             .into_iter()
             .filter(|v| v.len() >= 2)
             .collect();
@@ -3475,8 +4209,15 @@ impl Llm {
             return Err("no_tokenized_rows".to_string());
         }
 
-        // Ingestion state.
-        let mut st_ing = online_data_ingestion_state_ascii::new_default();
+        // Fixed control sets for retention (6).
+        // NOTE: Use deterministic slices from initial dataset as old/new proxies.
+        let v_control_old: Vec<Vec<usize>> = v_tokenized_data.iter().take(64.min(v_tokenized_data.len())).cloned().collect();
+        let v_control_new: Vec<Vec<usize>> = v_tokenized_data
+            .iter()
+            .rev()
+            .take(64.min(v_tokenized_data.len()))
+            .cloned()
+            .collect();
 
         // Find first ParallelBlockGroup.
         let mut opt_pg_idx: Option<usize> = None;
@@ -3494,13 +4235,33 @@ impl Llm {
                 .unwrap_or(20260213),
         );
 
-        // NOTE: These types exist earlier in layer.rs in the same module.
-        let mut st_branch_ema = branch_loss_ema_state_ascii::new(1, 0.2);
-        let mut rb_replay = replay_buffer_ascii::new(
-            if cfg_phase.b_enable_replay { 5000 } else { 0 },
-            20260213,
-        );
+        // Metrics state.
+        let mut met_ing = ingestion_metrics_ascii::new();
+        let mut met_cov = coverage_metrics_ascii::new();
+        let mut met_mask = mask_participation_metrics_ascii::new();
+        let mut met_inv = inverse_participation_scaling_metrics_ascii::new();
+        let mut met_replay = replay_metrics_ascii::new();
+        let mut met_ret = retention_metrics_ascii::new();
+        let mut met_fair = branch_fairness_metrics_ascii::new(1);
+        let mut met_snap = snapshot_metrics_ascii::new();
+        let mut met_expand = expansion_metrics_ascii::new();
+        let mut met_drift = drift_metrics_ascii::new();
 
+        // Ingestion state.
+        let mut st_ing = online_data_ingestion_state_ascii::new_default();
+
+        // Baseline retention evaluation at start of phase.
+        let d_old0 = self.eval_control_set_loss_ascii(&v_control_old, 64).unwrap_or(0.0);
+        let d_new0 = self.eval_control_set_loss_ascii(&v_control_new, 64).unwrap_or(0.0);
+        met_ret.d_loss_control_old = d_old0;
+        met_ret.d_loss_control_new = d_new0;
+        met_ret.d_retention_delta_old = 0.0;
+        met_ret.d_retention_delta_new = 0.0;
+        met_ret.u64_last_eval_ms = now_ms_ascii();
+
+        // EMA and replay internal state (existing).
+        let mut st_branch_ema = branch_loss_ema_state_ascii::new(1, 0.2);
+        let mut rb_replay = replay_buffer_ascii::new(if cfg_phase.b_enable_replay { 5000 } else { 0 }, 20260213);
         let i_replay_max_steps_per_row: usize = 1;
 
         let mut i_total_steps: usize = 0;
@@ -3509,38 +4270,49 @@ impl Llm {
         let mut i_skips_pg_downcast_failed: usize = 0;
         let mut i_skips_pg_no_branches: usize = 0;
 
+        // Drift prompts (10).
+        let v_drift_prompts: Vec<String> = vec![
+            "User: diagnostic prompt 1".to_string(),
+            "User: diagnostic prompt 2".to_string(),
+            "User: diagnostic prompt 3".to_string(),
+            "User: diagnostic prompt 4".to_string(),
+        ];
+
         for i_epoch in 0..i_epochs {
-            if b_cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            if b_cancel.load(AtomicOrdering::SeqCst) {
                 return Ok(());
             }
 
-            // Drain at epoch boundary to amortize and ensure quick reaction to new data.
+            // (1) Drain ingestion and update ingestion metrics.
             drain_training_data_events_non_blocking_ascii(
                 self,
                 opt_data_rx,
                 &mut v_tokenized_data,
                 &mut st_ing,
+                &mut met_ing,
             );
+
+            // (2) Coverage baseline for epoch.
+            met_cov.i_epoch_token_rows_start = v_tokenized_data.len();
+            let i_epoch_len = v_tokenized_data.len();
 
             let mut d_total_loss_used: f32 = 0.0;
             let mut i_used_rows: usize = 0;
             let mut d_last_step_loss: f32 = 0.0;
 
-            // Snapshot length per epoch to avoid shifting iteration windows.
-            let i_epoch_len = v_tokenized_data.len();
-
             for i_row_idx in 0..i_epoch_len {
-                if b_cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                if b_cancel.load(AtomicOrdering::SeqCst) {
                     return Ok(());
                 }
 
-                // Periodic non-blocking drain for responsiveness.
+                // Periodic drain for responsiveness.
                 if (i_total_steps % 50) == 0 {
                     drain_training_data_events_non_blocking_ascii(
                         self,
                         opt_data_rx,
                         &mut v_tokenized_data,
                         &mut st_ing,
+                        &mut met_ing,
                     );
                 }
 
@@ -3548,14 +4320,22 @@ impl Llm {
 
                 let b_ema_active = cfg_phase.ema_is_active(i_total_steps);
                 let d_replay_p = cfg_phase.replay_p_at_step(i_total_steps);
+                met_replay.d_replay_p_last = d_replay_p;
 
-                let (b_ok, d_loss) = self.train_one_row_continuous_learning_ascii(
+                // (5) Fresh step counter.
+                met_replay.inc_fresh();
+
+                // Train fresh row (includes mask and optional EMA selection).
+                let (b_ok, d_loss, opt_step_diag) = self.train_one_row_continuous_learning_with_metrics_ascii(
                     v_row,
                     d_lr,
                     opt_pg_idx,
                     &opt_cl,
                     &mut rng_mask,
                     &mut st_branch_ema,
+                    &mut met_mask,
+                    &mut met_inv,
+                    &mut met_fair,
                     &mut i_skips_empty_act,
                     &mut i_skips_empty_logits,
                     &mut i_skips_pg_downcast_failed,
@@ -3572,39 +4352,131 @@ impl Llm {
                 i_used_rows = i_used_rows.saturating_add(1);
                 i_total_steps = i_total_steps.saturating_add(1);
 
-                let d_running_epoch_avg_loss: f32 = if i_used_rows == 0 {
-                    0.0
-                } else {
-                    d_total_loss_used / (i_used_rows as f32).max(1.0)
-                };
-
-                // Replay logic remains unchanged.
+                // Replay buffer update and optional replay steps.
                 rb_replay.push_row(v_row);
                 if rb_replay.is_enabled() && rb_replay.len() > 0 && d_replay_p > 0.0 {
                     let d_u: f32 = rng_mask.gen_range(0.0..1.0);
                     if d_u < d_replay_p {
                         for _ in 0..i_replay_max_steps_per_row {
                             if let Some(v_rep) = rb_replay.sample_row() {
-                                let _ = self.train_one_row_continuous_learning_ascii(
+                                met_replay.inc_replay();
+                                let (b_ok_r, d_loss_r, _) = self.train_one_row_continuous_learning_with_metrics_ascii(
                                     &v_rep,
                                     d_lr,
                                     opt_pg_idx,
                                     &opt_cl,
                                     &mut rng_mask,
                                     &mut st_branch_ema,
+                                    &mut met_mask,
+                                    &mut met_inv,
+                                    &mut met_fair,
                                     &mut i_skips_empty_act,
                                     &mut i_skips_empty_logits,
                                     &mut i_skips_pg_downcast_failed,
                                     &mut i_skips_pg_no_branches,
                                     b_ema_active,
                                 )?;
+                                if b_ok_r {
+                                    met_replay.update_delta_loss(d_last_step_loss, d_loss_r);
+                                }
                             }
                         }
                     }
                 }
 
+                // (9) Autonomous expansion telemetry and (10) drift proxy around expansion.
+                if cfg_phase.b_enable_autonomous_expansion
+                    && cfg_phase.i_expand_check_every_steps > 0
+                    && (i_total_steps % cfg_phase.i_expand_check_every_steps) == 0
+                {
+                    // Compute drift baseline logits.
+                    let v_logits_before = self.compute_logits_for_prompts_ascii(&v_drift_prompts, 4).unwrap_or_else(|_| Vec::new());
+
+                    let v_diag_inputs = self
+                        .collect_parallel_block_group_inputs_for_diagnostics(&v_drift_prompts, 4)
+                        .unwrap_or_else(|_| Vec::new());
+
+                    let mut b_expanded: bool = false;
+                    let mut i_before: usize = 0;
+                    let mut i_after: usize = 0;
+
+                    if !v_diag_inputs.is_empty() {
+                        // Capture before branches.
+                        if let Some(i_pg) = opt_pg_idx {
+                            if let Some(pg) = self.network[i_pg].as_any_mut().and_then(|a| a.downcast_mut::<ParallelBlockGroup>()) {
+                                i_before = pg.num_branches();
+                            }
+                        }
+
+                        b_expanded = self.try_autonomous_expand_first_pg_ascii(&cfg_phase, &v_diag_inputs).unwrap_or(false);
+
+                        if b_expanded {
+                            if let Some(i_pg) = opt_pg_idx {
+                                if let Some(pg) = self.network[i_pg].as_any_mut().and_then(|a| a.downcast_mut::<ParallelBlockGroup>()) {
+                                    i_after = pg.num_branches();
+                                    // Best effort: compute sum of weights added (approx via eta and new count).
+                                    let d_eta = cfg_phase.d_eta_injection.clamp(0.0, 0.5);
+                                    let i_add = i_after.saturating_sub(i_before);
+                                    let d_sum_w_new = if i_add == 0 { 0.0 } else { d_eta };
+                                    met_expand.i_expansion_events_total = met_expand.i_expansion_events_total.saturating_add(1);
+                                    met_expand.i_branches_before_last = i_before;
+                                    met_expand.i_branches_after_last = i_after;
+                                    met_expand.d_eta_injection_last = d_eta;
+                                    met_expand.d_sum_w_new_last = d_sum_w_new;
+                                    met_expand.u64_last_event_ms = now_ms_ascii();
+                                }
+                            }
+
+                            // Compute drift after.
+                            let v_logits_after = self.compute_logits_for_prompts_ascii(&v_drift_prompts, 4).unwrap_or_else(|_| Vec::new());
+                            let i_cmp = v_logits_before.len().min(v_logits_after.len());
+                            for i in 0..i_cmp {
+                                let d_l2 = logits_distance_l2_ascii(&v_logits_before[i], &v_logits_after[i]);
+                                let d_cd = logits_cosine_distance_ascii(&v_logits_before[i], &v_logits_after[i]);
+                                met_drift.update(d_l2, d_cd);
+                            }
+                        }
+                    }
+                }
+
+                // (8) Snapshot send with timestamp and step tags.
+                if i_snapshot_every_steps > 0 && (i_total_steps % i_snapshot_every_steps) == 0 {
+                    if let Some(tx) = tx_snapshot.as_ref() {
+                        let v_params = self.export_parameters_snapshot();
+                        let u64_send = now_ms_ascii();
+                        met_snap.on_send(i_total_steps, u64_send);
+
+                        // NOTE: Snapshot payload remains Vec<f32> to keep compatibility with main.rs.
+                        // Latency and staleness must be computed on the receiving side (main.rs),
+                        // but sent counters and last-send timestamp remain useful on the training side.
+                        let _ = tx.send(v_params);
+                    }
+                }
+
+                // (6) Retention evaluation periodically.
+                if (i_total_steps % 500) == 0 {
+                    let d_old = self.eval_control_set_loss_ascii(&v_control_old, 64).unwrap_or(0.0);
+                    let d_new = self.eval_control_set_loss_ascii(&v_control_new, 64).unwrap_or(0.0);
+                    met_ret.d_retention_delta_old = d_old - d_old0;
+                    met_ret.d_retention_delta_new = d_new - d_new0;
+                    met_ret.d_loss_control_old = d_old;
+                    met_ret.d_loss_control_new = d_new;
+                    met_ret.u64_last_eval_ms = now_ms_ascii();
+                }
+
+                // (7) Recompute fairness summaries occasionally.
+                if (i_total_steps % 100) == 0 {
+                    met_fair.recompute();
+                }
+
                 // Progress event.
                 if (i_total_steps % 25) == 0 {
+                    let d_running_epoch_avg_loss: f32 = if i_used_rows == 0 {
+                        0.0
+                    } else {
+                        d_total_loss_used / (i_used_rows as f32).max(1.0)
+                    };
+
                     let mut ev = TrainingProgressEventAscii::new_basic(
                         s_phase,
                         i_epoch + 1,
@@ -3614,21 +4486,123 @@ impl Llm {
                         0,
                         i_total_steps,
                     );
+
+                    // Existing diagnostics.
                     ev.i_skips_empty_act = i_skips_empty_act;
                     ev.i_skips_empty_logits = i_skips_empty_logits;
                     ev.i_skips_pg_downcast_failed = i_skips_pg_downcast_failed;
                     ev.i_skips_pg_no_branches = i_skips_pg_no_branches;
+
+                    // (1) Ingestion metrics.
+                    ev.d_ingest_rows_per_sec_window = met_ing.d_rows_per_sec_window;
+                    ev.d_ingest_events_per_sec_window = met_ing.d_events_per_sec_window;
+                    ev.i_ingest_rows_added_total = met_ing.i_rows_added_total;
+                    ev.i_ingest_events_processed_total = met_ing.i_events_processed_total;
+                    ev.i_ingest_parse_errors_total = met_ing.i_parse_errors_total;
+                    ev.i_ingest_rows_rejected_total = met_ing.i_rows_rejected_total;
+                    ev.i_ingest_pending_events_observed_peak = met_ing.i_pending_events_observed_peak;
+
+                    // (2) Coverage: computed end of epoch; include interim approximations.
+                    ev.i_epoch_token_rows_start = met_cov.i_epoch_token_rows_start;
+                    ev.i_epoch_token_rows_end = v_tokenized_data.len();
+                    ev.i_new_rows_added_during_epoch =
+                        v_tokenized_data.len().saturating_sub(met_cov.i_epoch_token_rows_start);
+                    ev.d_coverage_ratio_used_over_available = if i_epoch_len == 0 {
+                        0.0
+                    } else {
+                        (i_used_rows as f32) / (i_epoch_len as f32).max(1.0)
+                    };
+                    ev.d_new_data_ratio_in_available = if v_tokenized_data.len() == 0 {
+                        0.0
+                    } else {
+                        (ev.i_new_rows_added_during_epoch as f32) / (v_tokenized_data.len() as f32).max(1.0)
+                    };
+
+                    // (3) Mask stats.
+                    ev.d_active_branches_mean = met_mask.d_active_branches_mean;
+                    ev.d_active_branches_std = met_mask.active_branches_std();
+                    ev.i_active_branches_min = if met_mask.i_active_branches_min == usize::MAX { 0 } else { met_mask.i_active_branches_min };
+                    ev.i_active_branches_max = met_mask.i_active_branches_max;
+                    ev.d_mask_sparsity_mean = met_mask.d_mask_sparsity_mean;
+                    ev.d_mask_sparsity_std = met_mask.sparsity_std();
+                    ev.d_steps_at_min_active_share = if met_mask.i_steps_observed == 0 {
+                        0.0
+                    } else {
+                        (met_mask.i_steps_at_min_active as f32) / (met_mask.i_steps_observed as f32).max(1.0)
+                    };
+
+                    // (4) Scaling impact.
+                    ev.d_grad_norm_ratio_scaled_over_unscaled_mean = met_inv.d_grad_norm_ratio_mean;
+                    ev.d_grad_norm_ratio_scaled_over_unscaled_std = met_inv.ratio_std();
+                    ev.d_grad_norm_scaled_mean = met_inv.d_grad_norm_scaled_mean;
+                    ev.d_grad_norm_unscaled_mean = met_inv.d_grad_norm_unscaled_mean;
+
+                    // (5) Replay.
+                    let i_total = met_replay.i_fresh_steps_total.saturating_add(met_replay.i_replay_steps_total);
+                    ev.d_replay_share = if i_total == 0 {
+                        0.0
+                    } else {
+                        (met_replay.i_replay_steps_total as f32) / (i_total as f32).max(1.0)
+                    };
+                    ev.d_replay_p_last = met_replay.d_replay_p_last;
+                    ev.d_replay_delta_loss_mean = met_replay.d_delta_loss_mean;
+                    ev.d_replay_delta_loss_std = met_replay.delta_loss_std();
+
+                    // (6) Retention.
+                    ev.d_loss_control_old = met_ret.d_loss_control_old;
+                    ev.d_loss_control_new = met_ret.d_loss_control_new;
+                    ev.d_retention_delta_old = met_ret.d_retention_delta_old;
+                    ev.d_retention_delta_new = met_ret.d_retention_delta_new;
+
+                    // (7) Fairness.
+                    ev.d_branch_select_gini = met_fair.d_gini_selected;
+                    ev.d_branch_select_top1_share = met_fair.d_top1_share_selected;
+
+                    // (8) Snapshot send counters.
+                    ev.i_snapshots_sent_total = met_snap.i_snapshots_sent_total;
+
+                    // (9) Expansion.
+                    ev.i_expansion_events_total = met_expand.i_expansion_events_total;
+                    ev.i_branches_before_last_expand = met_expand.i_branches_before_last;
+                    ev.i_branches_after_last_expand = met_expand.i_branches_after_last;
+                    ev.d_eta_injection_last = met_expand.d_eta_injection_last;
+                    ev.d_sum_w_new_last = met_expand.d_sum_w_new_last;
+
+                    // (10) Drift.
+                    ev.d_expand_drift_logits_l2_mean = met_drift.d_logits_l2_mean;
+                    ev.d_expand_drift_logits_l2_std = met_drift.l2_std();
+                    ev.d_expand_drift_logits_cos_dist_mean = met_drift.d_logits_cos_dist_mean;
+                    ev.d_expand_drift_logits_cos_dist_std = met_drift.cos_dist_std();
+
+                    // EMA.
+                    ev.b_ema_active = b_ema_active;
+                    ev.i_ema_last_selected_branch = st_branch_ema
+                        .opt_last_selected_branch
+                        .map(|i| i as isize)
+                        .unwrap_or(-1);
+
                     let _ = tx_progress.send(ev);
                 }
-
-                // Snapshot update for serving model.
-                if i_snapshot_every_steps > 0 && (i_total_steps % i_snapshot_every_steps) == 0 {
-                    if let Some(tx) = tx_snapshot.as_ref() {
-                        let v_params = self.export_parameters_snapshot();
-                        let _ = tx.send(v_params);
-                    }
-                }
             }
+
+            // End-of-epoch coverage finalize.
+            met_cov.i_epoch_token_rows_end = v_tokenized_data.len();
+            met_cov.i_epoch_rows_used = i_used_rows;
+            met_cov.i_new_rows_added_during_epoch = met_cov
+                .i_epoch_token_rows_end
+                .saturating_sub(met_cov.i_epoch_token_rows_start);
+
+            met_cov.d_coverage_ratio_used_over_available = if met_cov.i_epoch_token_rows_start == 0 {
+                0.0
+            } else {
+                (i_used_rows as f32) / (met_cov.i_epoch_token_rows_start as f32).max(1.0)
+            };
+
+            met_cov.d_new_data_ratio_in_available = if met_cov.i_epoch_token_rows_end == 0 {
+                0.0
+            } else {
+                (met_cov.i_new_rows_added_during_epoch as f32) / (met_cov.i_epoch_token_rows_end as f32).max(1.0)
+            };
 
             // End-of-epoch progress.
             let d_avg_loss: f32 = if i_used_rows == 0 {
@@ -3646,16 +4620,331 @@ impl Llm {
                 i_used_rows,
                 i_total_steps,
             );
+
+            // Attach key metrics at epoch end as well.
+            ev.i_rows_used_last_epoch = i_used_rows;
+            ev.i_epoch_token_rows_start = met_cov.i_epoch_token_rows_start;
+            ev.i_epoch_token_rows_end = met_cov.i_epoch_token_rows_end;
+            ev.i_new_rows_added_during_epoch = met_cov.i_new_rows_added_during_epoch;
+            ev.d_coverage_ratio_used_over_available = met_cov.d_coverage_ratio_used_over_available;
+            ev.d_new_data_ratio_in_available = met_cov.d_new_data_ratio_in_available;
+
+            ev.d_ingest_rows_per_sec_window = met_ing.d_rows_per_sec_window;
+            ev.d_ingest_events_per_sec_window = met_ing.d_events_per_sec_window;
+            ev.i_ingest_rows_added_total = met_ing.i_rows_added_total;
+            ev.i_ingest_events_processed_total = met_ing.i_events_processed_total;
+            ev.i_ingest_parse_errors_total = met_ing.i_parse_errors_total;
+            ev.i_ingest_rows_rejected_total = met_ing.i_rows_rejected_total;
+            ev.i_ingest_pending_events_observed_peak = met_ing.i_pending_events_observed_peak;
+
+            ev.d_active_branches_mean = met_mask.d_active_branches_mean;
+            ev.d_active_branches_std = met_mask.active_branches_std();
+            ev.i_active_branches_min = if met_mask.i_active_branches_min == usize::MAX { 0 } else { met_mask.i_active_branches_min };
+            ev.i_active_branches_max = met_mask.i_active_branches_max;
+            ev.d_mask_sparsity_mean = met_mask.d_mask_sparsity_mean;
+            ev.d_mask_sparsity_std = met_mask.sparsity_std();
+
+            ev.d_grad_norm_ratio_scaled_over_unscaled_mean = met_inv.d_grad_norm_ratio_mean;
+            ev.d_grad_norm_ratio_scaled_over_unscaled_std = met_inv.ratio_std();
+
+            let i_total = met_replay.i_fresh_steps_total.saturating_add(met_replay.i_replay_steps_total);
+            ev.d_replay_share = if i_total == 0 { 0.0 } else { (met_replay.i_replay_steps_total as f32) / (i_total as f32).max(1.0) };
+            ev.d_replay_delta_loss_mean = met_replay.d_delta_loss_mean;
+            ev.d_replay_delta_loss_std = met_replay.delta_loss_std();
+
+            ev.d_loss_control_old = met_ret.d_loss_control_old;
+            ev.d_loss_control_new = met_ret.d_loss_control_new;
+            ev.d_retention_delta_old = met_ret.d_retention_delta_old;
+            ev.d_retention_delta_new = met_ret.d_retention_delta_new;
+
+            met_fair.recompute();
+            ev.d_branch_select_gini = met_fair.d_gini_selected;
+            ev.d_branch_select_top1_share = met_fair.d_top1_share_selected;
+
+            ev.i_snapshots_sent_total = met_snap.i_snapshots_sent_total;
+
+            ev.i_expansion_events_total = met_expand.i_expansion_events_total;
+            ev.i_branches_before_last_expand = met_expand.i_branches_before_last;
+            ev.i_branches_after_last_expand = met_expand.i_branches_after_last;
+            ev.d_eta_injection_last = met_expand.d_eta_injection_last;
+            ev.d_sum_w_new_last = met_expand.d_sum_w_new_last;
+
+            ev.d_expand_drift_logits_l2_mean = met_drift.d_logits_l2_mean;
+            ev.d_expand_drift_logits_l2_std = met_drift.l2_std();
+            ev.d_expand_drift_logits_cos_dist_mean = met_drift.d_logits_cos_dist_mean;
+            ev.d_expand_drift_logits_cos_dist_std = met_drift.cos_dist_std();
+
+            ev.b_ema_active = cfg_phase.ema_is_active(i_total_steps);
+            ev.i_ema_last_selected_branch = st_branch_ema
+                .opt_last_selected_branch
+                .map(|i| i as isize)
+                .unwrap_or(-1);
+
             ev.i_skips_empty_act = i_skips_empty_act;
             ev.i_skips_empty_logits = i_skips_empty_logits;
             ev.i_skips_pg_downcast_failed = i_skips_pg_downcast_failed;
             ev.i_skips_pg_no_branches = i_skips_pg_no_branches;
+
             let _ = tx_progress.send(ev);
         }
 
         Ok(())
     }
 
+    // Wrapper around existing train_one_row_continuous_learning_ascii to extract
+    // mask stats, inverse scaling impact proxy, and fairness selection stats.
+    fn train_one_row_continuous_learning_with_metrics_ascii(
+        &mut self,
+        v_row: &[usize],
+        d_lr: f32,
+        opt_pg_idx: Option<usize>,
+        opt_cl: &Option<ContinuousLearningConfig>,
+        rng_mask: &mut StdRng,
+        st_branch_ema: &mut branch_loss_ema_state_ascii,
+        met_mask: &mut mask_participation_metrics_ascii,
+        met_inv: &mut inverse_participation_scaling_metrics_ascii,
+        met_fair: &mut branch_fairness_metrics_ascii,
+        i_skips_empty_act: &mut usize,
+        i_skips_empty_logits: &mut usize,
+        i_skips_pg_downcast_failed: &mut usize,
+        i_skips_pg_no_branches: &mut usize,
+        b_enable_ema_selection: bool,
+    ) -> Result<(bool, f32, Option<(usize, usize, bool)>), String> {
+        // History:
+        // - 2026-02-15: Add metric taps for mask participation, scaling proxy, and fairness.
+
+        if v_row.len() < 2 {
+            return Ok((false, 0.0, None));
+        }
+
+        // If there is a PG, sample mask similarly to original function, but collect stats.
+        if let Some(i_pg) = opt_pg_idx {
+            let i_k = match self.network[i_pg]
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
+            {
+                Some(pg) => pg.num_branches(),
+                None => {
+                    *i_skips_pg_downcast_failed = i_skips_pg_downcast_failed.saturating_add(1);
+                    return Ok((false, 0.0, None));
+                }
+            };
+
+            if i_k == 0 {
+                *i_skips_pg_no_branches = i_skips_pg_no_branches.saturating_add(1);
+                return Ok((false, 0.0, None));
+            }
+
+            let cl_cfg = opt_cl.clone().unwrap_or_else(|| ContinuousLearningConfig::new_default_for_num_branches(i_k));
+            cl_cfg.validate(i_k)?;
+
+            let v_available_mask = Self::sample_availability_mask(
+                rng_mask,
+                &cl_cfg.v_branch_participation_p,
+                cl_cfg.i_min_active_branches,
+            );
+
+            let i_active = v_available_mask.iter().filter(|&&b| b).count();
+            met_mask.update(i_active, i_k, cl_cfg.i_min_active_branches);
+
+            // EMA selection in original path: estimate selected branch for fairness.
+            let mut i_selected_branch: Option<usize> = None;
+            if b_enable_ema_selection {
+                    // Compute activation before calling select_branch... to avoid double mutable borrow.
+                    let a_act_before_pg = self.forward_prefix_to_pg_ascii(v_row, i_pg)?;
+
+                    if let Ok(i_sel) = self.select_branch_min_ema_loss_ascii(
+                        st_branch_ema,
+                        i_pg,
+                        &a_act_before_pg,
+                        &v_row[1..],
+                        &v_available_mask,
+                    ) {
+                        i_selected_branch = Some(i_sel);
+                    }
+                }
+
+            met_fair.ensure_len(i_k);
+            if let Some(i_sel) = i_selected_branch {
+                met_fair.on_select(i_sel);
+            }
+
+            // (4) Inverse participation scaling impact proxy:
+            // compute grad norms for scaled and unscaled for identical row and mask, without updating weights
+            // by using "dry run" gradients; then perform actual training using existing function.
+            if cl_cfg.b_scale_by_inverse_participation && (met_inv.i_samples < 5000) && (i_active > 0) {
+                let (d_g_scaled, d_g_unscaled) = self.compute_grad_norm_scaled_unscaled_proxy_ascii(
+                    v_row,
+                    d_lr,
+                    i_pg,
+                    &cl_cfg,
+                    &v_available_mask,
+                    i_selected_branch,
+                )?;
+                met_inv.update(d_g_scaled, d_g_unscaled);
+            }
+
+            let (b_ok, d_loss) = self.train_one_row_continuous_learning_ascii(
+                v_row,
+                d_lr,
+                opt_pg_idx,
+                opt_cl,
+                rng_mask,
+                st_branch_ema,
+                i_skips_empty_act,
+                i_skips_empty_logits,
+                i_skips_pg_downcast_failed,
+                i_skips_pg_no_branches,
+                b_enable_ema_selection,
+            )?;
+
+            Ok((b_ok, d_loss, Some((i_active, i_k, b_enable_ema_selection))))
+        } else {
+            let (b_ok, d_loss) = self.train_one_row_continuous_learning_ascii(
+                v_row,
+                d_lr,
+                opt_pg_idx,
+                opt_cl,
+                rng_mask,
+                st_branch_ema,
+                i_skips_empty_act,
+                i_skips_empty_logits,
+                i_skips_pg_downcast_failed,
+                i_skips_pg_no_branches,
+                b_enable_ema_selection,
+            )?;
+            Ok((b_ok, d_loss, None))
+        }
+    }
+    // Forward prefix helper to compute activations before PG for EMA selection proxy.
+    fn forward_prefix_to_pg_ascii(&mut self, v_row: &[usize], i_pg: usize) -> Result<Array2<f32>, String> {
+        if v_row.len() < 2 {
+            return Err("prefix_row_too_short".to_string());
+        }
+        let v_input_ids = &v_row[..v_row.len() - 1];
+        let a_token_input: Array2<f32> = Array2::from_shape_vec(
+            (1, v_input_ids.len()),
+            v_input_ids.iter().map(|&x| x as f32).collect::<Vec<f32>>(),
+        )
+        .map_err(|_| "prefix_shape_error_token_input".to_string())?;
+
+        let mut a_act = a_token_input;
+        for i_l in 0..i_pg {
+            a_act = self.network[i_l].forward(&a_act);
+            if a_act.nrows() == 0 || a_act.ncols() == 0 {
+                return Err("prefix_empty_act".to_string());
+            }
+        }
+        Ok(a_act)
+    }
+
+    // Proxy grad norm computation: scaled vs unscaled, for same mask and same row.
+    // This computes gradients at logits only and does not update any weights.
+    fn compute_grad_norm_scaled_unscaled_proxy_ascii(
+        &mut self,
+        v_row: &[usize],
+        _d_lr: f32,
+        i_pg: usize,
+        cl_cfg: &ContinuousLearningConfig,
+        v_available_mask: &[bool],
+        opt_selected_branch: Option<usize>,
+    ) -> Result<(f32, f32), String> {
+        if v_row.len() < 2 {
+            return Ok((0.0, 0.0));
+        }
+        if i_pg >= self.network.len() {
+            return Err("inv_proxy_pg_oob".to_string());
+        }
+
+        let v_input_ids = &v_row[..v_row.len() - 1];
+        let v_target_ids = &v_row[1..];
+
+        let a_token_input: Array2<f32> = Array2::from_shape_vec(
+            (1, v_input_ids.len()),
+            v_input_ids.iter().map(|&x| x as f32).collect::<Vec<f32>>(),
+        )
+        .map_err(|_| "inv_proxy_shape_error_token_input".to_string())?;
+
+        // Forward prefix to PG.
+        let mut a_act = a_token_input;
+        for i_l in 0..i_pg {
+            a_act = self.network[i_l].forward(&a_act);
+            if a_act.nrows() == 0 || a_act.ncols() == 0 {
+                return Ok((0.0, 0.0));
+            }
+        }
+
+        // Decide training mask (single selected or available).
+        let i_k = v_available_mask.len();
+        let v_train_mask: Vec<bool> = if let Some(i_sel) = opt_selected_branch {
+            Self::make_single_branch_mask_ascii(i_k, i_sel)
+        } else {
+            v_available_mask.to_vec()
+        };
+
+        // Forward PG.
+        let a_after_pg = {
+            let pg = self.network[i_pg]
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
+                .ok_or_else(|| "inv_proxy_pg_downcast_failed".to_string())?;
+            pg.forward_with_availability_mask(&a_act, &v_train_mask)
+        };
+        if a_after_pg.nrows() == 0 || a_after_pg.ncols() == 0 {
+            return Ok((0.0, 0.0));
+        }
+
+        // Forward tail to logits.
+        let a_logits = self.forward_from_layer_index_ascii(i_pg + 1, &a_after_pg)?;
+        if a_logits.nrows() == 0 || a_logits.ncols() == 0 {
+            return Ok((0.0, 0.0));
+        }
+
+        let a_probs = math::softmax_rows(&a_logits);
+
+        // Gradients at logits.
+        let mut a_grads = math::compute_gradients_step(&a_probs, v_target_ids);
+        math::sanitize_gradients_inplace(&mut a_grads);
+
+        // Unscaled grad norm.
+        let d_norm_unscaled = {
+            let mut d_sum: f32 = 0.0;
+            for &d in a_grads.iter() {
+                d_sum += d * d;
+            }
+            math::sanitize_f32(d_sum.sqrt())
+        };
+
+        // Scaled grad norm: apply inverse participation scaling on logits grads as proxy.
+        // NOTE: True scaling is applied at branch backward, but this proxy captures magnitude shift.
+        let mut a_grads_scaled = a_grads.clone();
+        if cl_cfg.b_scale_by_inverse_participation {
+            // Apply average scale over active branches.
+            let mut d_scale_sum: f32 = 0.0;
+            let mut i_cnt: usize = 0;
+            for (i_b, &b_on) in v_train_mask.iter().enumerate() {
+                if !b_on {
+                    continue;
+                }
+                let p = cl_cfg.v_branch_participation_p.get(i_b).copied().unwrap_or(1.0).max(1e-6);
+                let d_inv = (1.0 / p).clamp(1.0, 5.0);
+                d_scale_sum += d_inv;
+                i_cnt = i_cnt.saturating_add(1);
+            }
+            let d_avg_scale = if i_cnt == 0 { 1.0 } else { d_scale_sum / (i_cnt as f32).max(1.0) };
+            a_grads_scaled.mapv_inplace(|x| x * d_avg_scale);
+        }
+
+        let d_norm_scaled = {
+            let mut d_sum: f32 = 0.0;
+            for &d in a_grads_scaled.iter() {
+                d_sum += d * d;
+            }
+            math::sanitize_f32(d_sum.sqrt())
+        };
+
+        Ok((d_norm_scaled, d_norm_unscaled))
+    }
     fn try_autonomous_expand_first_pg_ascii(
         &mut self,
         cfg_phase: &phase_strategy_config_ascii,
@@ -4659,6 +5948,119 @@ pub fn train_with_progress_continuous_learning_ascii(
         }
 
         self.set_training(b_prev);
+    }
+
+    // Evaluate average loss on a fixed control set (token rows), without updating weights.
+    // NOTE: This temporarily switches to eval mode and does forward-only.
+    fn eval_control_set_loss_ascii(&mut self, v_token_rows: &[Vec<usize>], i_max_rows: usize) -> Result<f32, String> {
+        if v_token_rows.is_empty() || i_max_rows == 0 {
+            return Ok(0.0);
+        }
+
+        let b_prev = self.b_training;
+        self.set_training(false);
+
+        let mut d_sum: f32 = 0.0;
+        let mut i_used: usize = 0;
+
+        let i_take = i_max_rows.min(v_token_rows.len());
+        for v_row in v_token_rows.iter().take(i_take) {
+            if v_row.len() < 2 {
+                continue;
+            }
+            let v_input_ids = &v_row[..v_row.len() - 1];
+            let v_target_ids = &v_row[1..];
+
+            let a_token_input: Array2<f32> = Array2::from_shape_vec(
+                (1, v_input_ids.len()),
+                v_input_ids.iter().map(|&x| x as f32).collect::<Vec<f32>>(),
+            )
+            .map_err(|_| "control_eval_shape_error".to_string())?;
+
+            let mut a_act = a_token_input;
+            for layer in self.network.iter_mut() {
+                a_act = layer.forward(&a_act);
+                if a_act.nrows() == 0 || a_act.ncols() == 0 {
+                    a_act = Array2::zeros((0, 0));
+                    break;
+                }
+            }
+
+            if a_act.nrows() == 0 || a_act.ncols() == 0 {
+                continue;
+            }
+
+            let a_probs = math::softmax_rows(&a_act);
+            let d_loss = math::cross_entropy_loss_step(&a_probs, v_target_ids);
+            if d_loss.is_finite() {
+                d_sum += d_loss;
+                i_used = i_used.saturating_add(1);
+            }
+        }
+
+        self.set_training(b_prev);
+
+        if i_used == 0 {
+            Ok(0.0)
+        } else {
+            Ok(d_sum / (i_used as f32).max(1.0))
+        }
+    }
+    // Compute drift proxy for a set of prompts by comparing last-step logits.
+    // This is used around expansion events to quantify functional continuity.
+    fn compute_logits_for_prompts_ascii(&mut self, v_prompts: &[String], i_max_samples: usize) -> Result<Vec<Array2<f32>>, String> {
+        if v_prompts.is_empty() || i_max_samples == 0 {
+            return Err("drift_prompts_invalid".to_string());
+        }
+
+        let b_prev = self.b_training;
+        self.set_training(false);
+
+        let mut v_out: Vec<Array2<f32>> = Vec::new();
+        let i_take = i_max_samples.min(v_prompts.len());
+
+        for s in v_prompts.iter().take(i_take) {
+            let v_ids = match self.tokenize(s) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if v_ids.len() < 2 {
+                continue;
+            }
+
+            let a_token_input: Array2<f32> = Array2::from_shape_vec(
+                (1, v_ids.len()),
+                v_ids.iter().map(|&x| x as f32).collect::<Vec<f32>>(),
+            )
+            .map_err(|_| "drift_shape_error_token_input".to_string())?;
+
+            let mut a_act = a_token_input;
+            for layer in self.network.iter_mut() {
+                a_act = layer.forward(&a_act);
+                if a_act.nrows() == 0 || a_act.ncols() == 0 {
+                    a_act = Array2::zeros((0, 0));
+                    break;
+                }
+            }
+            if a_act.nrows() == 0 || a_act.ncols() == 0 {
+                continue;
+            }
+
+            // Take last row logits.
+            let a_last = a_act
+                .row(a_act.nrows().saturating_sub(1))
+                .to_owned()
+                .insert_axis(Axis(0));
+            v_out.push(a_last);
+        }
+
+        self.set_training(b_prev);
+
+        if v_out.is_empty() {
+            return Err("drift_no_valid_logits".to_string());
+        }
+
+        Ok(v_out)
     }
 }
 

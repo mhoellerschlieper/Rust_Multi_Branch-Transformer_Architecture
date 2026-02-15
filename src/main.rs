@@ -17,6 +17,7 @@
 // - 2026-02-13: Add background training, live metrics, cooperative stop.
 // - 2026-02-13: Add serving model with snapshot updates for true parallel ask during training.
 // - 2026-02-14: Add online ingestion channel and robust menu wiring for command b.
+// - 2026-02-15: Add help function for menu and metrics documentation (ASCII).
 // Author: Marcus Schlieper (ExpChat.ai)
 
 #![allow(warnings)]
@@ -179,6 +180,172 @@ struct predict_metrics_ascii {
     i_pred_stats_steps: usize,
 }
 
+#[derive(Clone, Debug)]
+struct training_metrics_snapshot_ascii {
+    b_running: bool,
+    b_cancel_requested: bool,
+    s_phase: String,
+    i_epoch_current: usize,
+    i_epochs_total: usize,
+    d_last_epoch_loss: f32,
+    d_last_step_loss: f32,
+    i_rows_used_last_epoch: usize,
+    i_total_steps: usize,
+    s_last_error: String,
+
+    i_skips_empty_act: usize,
+    i_skips_empty_logits: usize,
+    i_skips_pg_downcast_failed: usize,
+    i_skips_pg_no_branches: usize,
+
+    // ---- New metrics fields (mirrors TrainingProgressEventAscii) ----
+
+    // 1) Ingestion
+    d_ingest_rows_per_sec_window: f32,
+    d_ingest_events_per_sec_window: f32,
+    i_ingest_rows_added_total: usize,
+    i_ingest_events_processed_total: usize,
+    i_ingest_parse_errors_total: usize,
+    i_ingest_rows_rejected_total: usize,
+    i_ingest_pending_events_observed_peak: usize,
+
+    // 2) Coverage
+    d_coverage_ratio_used_over_available: f32,
+    d_new_data_ratio_in_available: f32,
+    i_new_rows_added_during_epoch: usize,
+    i_epoch_token_rows_start: usize,
+    i_epoch_token_rows_end: usize,
+
+    // 3) Mask stats
+    d_active_branches_mean: f32,
+    d_active_branches_std: f32,
+    i_active_branches_min: usize,
+    i_active_branches_max: usize,
+    d_mask_sparsity_mean: f32,
+    d_mask_sparsity_std: f32,
+    d_steps_at_min_active_share: f32,
+
+    // 4) Scaling proxy
+    d_grad_norm_ratio_scaled_over_unscaled_mean: f32,
+    d_grad_norm_ratio_scaled_over_unscaled_std: f32,
+    d_grad_norm_scaled_mean: f32,
+    d_grad_norm_unscaled_mean: f32,
+
+    // 5) Replay
+    d_replay_share: f32,
+    d_replay_p_last: f32,
+    d_replay_delta_loss_mean: f32,
+    d_replay_delta_loss_std: f32,
+
+    // 6) Retention
+    d_loss_control_old: f32,
+    d_loss_control_new: f32,
+    d_retention_delta_old: f32,
+    d_retention_delta_new: f32,
+
+    // 7) Fairness
+    d_branch_select_gini: f32,
+    d_branch_select_top1_share: f32,
+
+    // 8) Snapshot (training side only in this patch)
+    i_snapshots_sent_total: usize,
+
+    // 9) Expansion telemetry
+    i_expansion_events_total: usize,
+    i_branches_before_last_expand: usize,
+    i_branches_after_last_expand: usize,
+    d_eta_injection_last: f32,
+    d_sum_w_new_last: f32,
+
+    // 10) Drift
+    d_expand_drift_logits_l2_mean: f32,
+    d_expand_drift_logits_l2_std: f32,
+    d_expand_drift_logits_cos_dist_mean: f32,
+    d_expand_drift_logits_cos_dist_std: f32,
+
+    // EMA
+    b_ema_active: bool,
+    i_ema_last_selected_branch: isize,
+}
+
+impl training_metrics_snapshot_ascii {
+    fn new_idle() -> Self {
+        Self {
+            b_running: false,
+            b_cancel_requested: false,
+            s_phase: "idle".to_string(),
+            i_epoch_current: 0,
+            i_epochs_total: 0,
+            d_last_epoch_loss: 0.0,
+            d_last_step_loss: 0.0,
+            i_rows_used_last_epoch: 0,
+            i_total_steps: 0,
+            s_last_error: "".to_string(),
+
+            i_skips_empty_act: 0,
+            i_skips_empty_logits: 0,
+            i_skips_pg_downcast_failed: 0,
+            i_skips_pg_no_branches: 0,
+
+            d_ingest_rows_per_sec_window: 0.0,
+            d_ingest_events_per_sec_window: 0.0,
+            i_ingest_rows_added_total: 0,
+            i_ingest_events_processed_total: 0,
+            i_ingest_parse_errors_total: 0,
+            i_ingest_rows_rejected_total: 0,
+            i_ingest_pending_events_observed_peak: 0,
+
+            d_coverage_ratio_used_over_available: 0.0,
+            d_new_data_ratio_in_available: 0.0,
+            i_new_rows_added_during_epoch: 0,
+            i_epoch_token_rows_start: 0,
+            i_epoch_token_rows_end: 0,
+
+            d_active_branches_mean: 0.0,
+            d_active_branches_std: 0.0,
+            i_active_branches_min: 0,
+            i_active_branches_max: 0,
+            d_mask_sparsity_mean: 0.0,
+            d_mask_sparsity_std: 0.0,
+            d_steps_at_min_active_share: 0.0,
+
+            d_grad_norm_ratio_scaled_over_unscaled_mean: 0.0,
+            d_grad_norm_ratio_scaled_over_unscaled_std: 0.0,
+            d_grad_norm_scaled_mean: 0.0,
+            d_grad_norm_unscaled_mean: 0.0,
+
+            d_replay_share: 0.0,
+            d_replay_p_last: 0.0,
+            d_replay_delta_loss_mean: 0.0,
+            d_replay_delta_loss_std: 0.0,
+
+            d_loss_control_old: 0.0,
+            d_loss_control_new: 0.0,
+            d_retention_delta_old: 0.0,
+            d_retention_delta_new: 0.0,
+
+            d_branch_select_gini: 0.0,
+            d_branch_select_top1_share: 0.0,
+
+            i_snapshots_sent_total: 0,
+
+            i_expansion_events_total: 0,
+            i_branches_before_last_expand: 0,
+            i_branches_after_last_expand: 0,
+            d_eta_injection_last: 0.0,
+            d_sum_w_new_last: 0.0,
+
+            d_expand_drift_logits_l2_mean: 0.0,
+            d_expand_drift_logits_l2_std: 0.0,
+            d_expand_drift_logits_cos_dist_mean: 0.0,
+            d_expand_drift_logits_cos_dist_std: 0.0,
+
+            b_ema_active: false,
+            i_ema_last_selected_branch: -1,
+        }
+    }
+}
+
 fn clamp_f64(d_x: f64, d_min: f64, d_max: f64) -> f64 {
     if !d_x.is_finite() {
         return d_min;
@@ -275,76 +442,13 @@ fn print_predict_metrics_ascii(m: &predict_metrics_ascii) {
     println!("pred_stats_steps: {}", m.i_pred_stats_steps);
 }
 
-#[derive(Clone, Debug)]
-struct training_metrics_snapshot_ascii {
-    b_running: bool,
-    b_cancel_requested: bool,
-    s_phase: String,
-    i_epoch_current: usize,
-    i_epochs_total: usize,
-    d_last_epoch_loss: f32,
-    d_last_step_loss: f32,
-    i_rows_used_last_epoch: usize,
-    i_total_steps: usize,
-    s_last_error: String,
-
-    // Diagnostics counters.
-    i_skips_empty_act: usize,
-    i_skips_empty_logits: usize,
-    i_skips_pg_downcast_failed: usize,
-    i_skips_pg_no_branches: usize,
-}
-
-impl training_metrics_snapshot_ascii {
-    fn new_idle() -> Self {
-        Self {
-            b_running: false,
-            b_cancel_requested: false,
-            s_phase: "idle".to_string(),
-            i_epoch_current: 0,
-            i_epochs_total: 0,
-            d_last_epoch_loss: 0.0,
-            d_last_step_loss: 0.0,
-            i_rows_used_last_epoch: 0,
-            i_total_steps: 0,
-            s_last_error: "".to_string(),
-
-            // Diagnostics counters.
-            i_skips_empty_act: 0,
-            i_skips_empty_logits: 0,
-            i_skips_pg_downcast_failed: 0,
-            i_skips_pg_no_branches: 0,
-        }
-    }
-}
-
-fn print_training_metrics_snapshot_ascii(m: &training_metrics_snapshot_ascii) {
-    println!();
-    println!("=== Training Metrics ===");
-    println!("running: {}", m.b_running);
-    println!("cancel_requested: {}", m.b_cancel_requested);
-    println!("phase: {}", m.s_phase);
-    println!("epoch: {} / {}", m.i_epoch_current, m.i_epochs_total);
-    println!("last_epoch_loss: {:.6}", m.d_last_epoch_loss);
-    println!("last_step_loss: {:.6}", m.d_last_step_loss);
-    println!("rows_used_last_epoch: {}", m.i_rows_used_last_epoch);
-    println!("total_steps: {}", m.i_total_steps);
-
-    println!("skips_empty_act: {}", m.i_skips_empty_act);
-    println!("skips_empty_logits: {}", m.i_skips_empty_logits);
-    println!("skips_pg_downcast_failed: {}", m.i_skips_pg_downcast_failed);
-    println!("skips_pg_no_branches: {}", m.i_skips_pg_no_branches);
-
-    if !m.s_last_error.is_empty() {
-        println!("last_error: {}", m.s_last_error);
-    }
-}
-
 fn drain_training_progress_non_blocking(
-    opt_rx: &mut Option<mpsc::Receiver<TrainingProgressEventAscii>>,
-    metrics_shared: &Arc<Mutex<training_metrics_snapshot_ascii>>,
-    b_cancel_train: &Arc<AtomicBool>,
+    opt_rx: &mut Option<std::sync::mpsc::Receiver<crate::layer::TrainingProgressEventAscii>>,
+    metrics_shared: &std::sync::Arc<std::sync::Mutex<training_metrics_snapshot_ascii>>,
+    b_cancel_train: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
+    use std::sync::mpsc;
+
     let rx = match opt_rx.as_mut() {
         Some(r) => r,
         None => return,
@@ -366,7 +470,7 @@ fn drain_training_progress_non_blocking(
         };
 
         m.b_running = true;
-        m.b_cancel_requested = b_cancel_train.load(Ordering::SeqCst);
+        m.b_cancel_requested = b_cancel_train.load(std::sync::atomic::Ordering::SeqCst);
         m.s_phase = ev.s_phase;
         m.i_epoch_current = ev.i_epoch_current;
         m.i_epochs_total = ev.i_epochs_total;
@@ -379,19 +483,343 @@ fn drain_training_progress_non_blocking(
         m.i_skips_empty_logits = ev.i_skips_empty_logits;
         m.i_skips_pg_downcast_failed = ev.i_skips_pg_downcast_failed;
         m.i_skips_pg_no_branches = ev.i_skips_pg_no_branches;
+
+        // New metrics copy.
+        m.d_ingest_rows_per_sec_window = ev.d_ingest_rows_per_sec_window;
+        m.d_ingest_events_per_sec_window = ev.d_ingest_events_per_sec_window;
+        m.i_ingest_rows_added_total = ev.i_ingest_rows_added_total;
+        m.i_ingest_events_processed_total = ev.i_ingest_events_processed_total;
+        m.i_ingest_parse_errors_total = ev.i_ingest_parse_errors_total;
+        m.i_ingest_rows_rejected_total = ev.i_ingest_rows_rejected_total;
+        m.i_ingest_pending_events_observed_peak = ev.i_ingest_pending_events_observed_peak;
+
+        m.d_coverage_ratio_used_over_available = ev.d_coverage_ratio_used_over_available;
+        m.d_new_data_ratio_in_available = ev.d_new_data_ratio_in_available;
+        m.i_new_rows_added_during_epoch = ev.i_new_rows_added_during_epoch;
+        m.i_epoch_token_rows_start = ev.i_epoch_token_rows_start;
+        m.i_epoch_token_rows_end = ev.i_epoch_token_rows_end;
+
+        m.d_active_branches_mean = ev.d_active_branches_mean;
+        m.d_active_branches_std = ev.d_active_branches_std;
+        m.i_active_branches_min = ev.i_active_branches_min;
+        m.i_active_branches_max = ev.i_active_branches_max;
+        m.d_mask_sparsity_mean = ev.d_mask_sparsity_mean;
+        m.d_mask_sparsity_std = ev.d_mask_sparsity_std;
+        m.d_steps_at_min_active_share = ev.d_steps_at_min_active_share;
+
+        m.d_grad_norm_ratio_scaled_over_unscaled_mean = ev.d_grad_norm_ratio_scaled_over_unscaled_mean;
+        m.d_grad_norm_ratio_scaled_over_unscaled_std = ev.d_grad_norm_ratio_scaled_over_unscaled_std;
+        m.d_grad_norm_scaled_mean = ev.d_grad_norm_scaled_mean;
+        m.d_grad_norm_unscaled_mean = ev.d_grad_norm_unscaled_mean;
+
+        m.d_replay_share = ev.d_replay_share;
+        m.d_replay_p_last = ev.d_replay_p_last;
+        m.d_replay_delta_loss_mean = ev.d_replay_delta_loss_mean;
+        m.d_replay_delta_loss_std = ev.d_replay_delta_loss_std;
+
+        m.d_loss_control_old = ev.d_loss_control_old;
+        m.d_loss_control_new = ev.d_loss_control_new;
+        m.d_retention_delta_old = ev.d_retention_delta_old;
+        m.d_retention_delta_new = ev.d_retention_delta_new;
+
+        m.d_branch_select_gini = ev.d_branch_select_gini;
+        m.d_branch_select_top1_share = ev.d_branch_select_top1_share;
+
+        m.i_snapshots_sent_total = ev.i_snapshots_sent_total;
+
+        m.i_expansion_events_total = ev.i_expansion_events_total;
+        m.i_branches_before_last_expand = ev.i_branches_before_last_expand;
+        m.i_branches_after_last_expand = ev.i_branches_after_last_expand;
+        m.d_eta_injection_last = ev.d_eta_injection_last;
+        m.d_sum_w_new_last = ev.d_sum_w_new_last;
+
+        m.d_expand_drift_logits_l2_mean = ev.d_expand_drift_logits_l2_mean;
+        m.d_expand_drift_logits_l2_std = ev.d_expand_drift_logits_l2_std;
+        m.d_expand_drift_logits_cos_dist_mean = ev.d_expand_drift_logits_cos_dist_mean;
+        m.d_expand_drift_logits_cos_dist_std = ev.d_expand_drift_logits_cos_dist_std;
+
+        m.b_ema_active = ev.b_ema_active;
+        m.i_ema_last_selected_branch = ev.i_ema_last_selected_branch;
+    }
+}
+fn print_training_metrics_snapshot_ascii(m: &training_metrics_snapshot_ascii) {
+    println!();
+    println!("=== Training Metrics ===");
+    println!("running: {}", m.b_running);
+    println!("cancel_requested: {}", m.b_cancel_requested);
+    println!("phase: {}", m.s_phase);
+    println!("epoch: {} / {}", m.i_epoch_current, m.i_epochs_total);
+    println!("last_epoch_loss: {:.6}", m.d_last_epoch_loss);
+    println!("last_step_loss: {:.6}", m.d_last_step_loss);
+    println!("rows_used_last_epoch: {}", m.i_rows_used_last_epoch);
+    println!("total_steps: {}", m.i_total_steps);
+
+    println!("skips_empty_act: {}", m.i_skips_empty_act);
+    println!("skips_empty_logits: {}", m.i_skips_empty_logits);
+    println!("skips_pg_downcast_failed: {}", m.i_skips_pg_downcast_failed);
+    println!("skips_pg_no_branches: {}", m.i_skips_pg_no_branches);
+
+    println!();
+    println!("--- Continuous Learning Metrics ---");
+
+    // 1) Ingestion throughput and queue proxy.
+    println!("ingest_rows_per_sec_window: {:.3}", m.d_ingest_rows_per_sec_window);
+    println!("ingest_events_per_sec_window: {:.3}", m.d_ingest_events_per_sec_window);
+    println!("ingest_rows_added_total: {}", m.i_ingest_rows_added_total);
+    println!("ingest_events_processed_total: {}", m.i_ingest_events_processed_total);
+    println!("ingest_parse_errors_total: {}", m.i_ingest_parse_errors_total);
+    println!("ingest_rows_rejected_total: {}", m.i_ingest_rows_rejected_total);
+    println!(
+        "ingest_pending_events_observed_peak: {}",
+        m.i_ingest_pending_events_observed_peak
+    );
+
+    // 2) Coverage ratio.
+    println!(
+        "coverage_ratio_used_over_available: {:.6}",
+        m.d_coverage_ratio_used_over_available
+    );
+    println!(
+        "new_data_ratio_in_available: {:.6}",
+        m.d_new_data_ratio_in_available
+    );
+    println!("new_rows_added_during_epoch: {}", m.i_new_rows_added_during_epoch);
+    println!("epoch_token_rows_start: {}", m.i_epoch_token_rows_start);
+    println!("epoch_token_rows_end: {}", m.i_epoch_token_rows_end);
+
+    // 3) Mask participation.
+    println!("active_branches_mean: {:.6}", m.d_active_branches_mean);
+    println!("active_branches_std: {:.6}", m.d_active_branches_std);
+    println!("active_branches_min: {}", m.i_active_branches_min);
+    println!("active_branches_max: {}", m.i_active_branches_max);
+    println!("mask_sparsity_mean: {:.6}", m.d_mask_sparsity_mean);
+    println!("mask_sparsity_std: {:.6}", m.d_mask_sparsity_std);
+    println!("steps_at_min_active_share: {:.6}", m.d_steps_at_min_active_share);
+
+    // 4) Inverse participation scaling impact.
+    println!(
+        "grad_norm_ratio_scaled_over_unscaled_mean: {:.6}",
+        m.d_grad_norm_ratio_scaled_over_unscaled_mean
+    );
+    println!(
+        "grad_norm_ratio_scaled_over_unscaled_std: {:.6}",
+        m.d_grad_norm_ratio_scaled_over_unscaled_std
+    );
+    println!("grad_norm_scaled_mean: {:.6}", m.d_grad_norm_scaled_mean);
+    println!("grad_norm_unscaled_mean: {:.6}", m.d_grad_norm_unscaled_mean);
+
+    // 5) Replay usage and effect.
+    println!("replay_share: {:.6}", m.d_replay_share);
+    println!("replay_p_last: {:.6}", m.d_replay_p_last);
+    println!("replay_delta_loss_mean: {:.6}", m.d_replay_delta_loss_mean);
+    println!("replay_delta_loss_std: {:.6}", m.d_replay_delta_loss_std);
+
+    // 6) Retention / forgetting.
+    println!("loss_control_old: {:.6}", m.d_loss_control_old);
+    println!("loss_control_new: {:.6}", m.d_loss_control_new);
+    println!("retention_delta_old: {:.6}", m.d_retention_delta_old);
+    println!("retention_delta_new: {:.6}", m.d_retention_delta_new);
+
+    // 7) Fairness.
+    println!("branch_select_gini: {:.6}", m.d_branch_select_gini);
+    println!("branch_select_top1_share: {:.6}", m.d_branch_select_top1_share);
+
+    // 8) Snapshot counters (latency and staleness require receiver side instrumentation).
+    println!("snapshots_sent_total: {}", m.i_snapshots_sent_total);
+
+    // 9) Expansion telemetry.
+    println!("expansion_events_total: {}", m.i_expansion_events_total);
+    println!(
+        "branches_before_last_expand: {}",
+        m.i_branches_before_last_expand
+    );
+    println!(
+        "branches_after_last_expand: {}",
+        m.i_branches_after_last_expand
+    );
+    println!("eta_injection_last: {:.6}", m.d_eta_injection_last);
+    println!("sum_w_new_last: {:.6}", m.d_sum_w_new_last);
+
+    // 10) Drift proxy.
+    println!(
+        "expand_drift_logits_l2_mean: {:.6}",
+        m.d_expand_drift_logits_l2_mean
+    );
+    println!(
+        "expand_drift_logits_l2_std: {:.6}",
+        m.d_expand_drift_logits_l2_std
+    );
+    println!(
+        "expand_drift_logits_cos_dist_mean: {:.6}",
+        m.d_expand_drift_logits_cos_dist_mean
+    );
+    println!(
+        "expand_drift_logits_cos_dist_std: {:.6}",
+        m.d_expand_drift_logits_cos_dist_std
+    );
+
+    // EMA.
+    println!("ema_active: {}", m.b_ema_active);
+    println!("ema_last_selected_branch: {}", m.i_ema_last_selected_branch);
+
+    if !m.s_last_error.is_empty() {
+        println!("last_error: {}", m.s_last_error);
     }
 }
 
+// Help function: explains all menu items and all metrics in ASCII only.
+fn print_help_ascii() {
+    println!();
+    println!("=== Help (ASCII) ===");
+    println!();
+    println!("Menu commands:");
+    println!("  t  Train (background, continuous learning)");
+    println!("     - Starts background training on llm_train.");
+    println!("     - Serving (ask) continues on llm_serve and receives snapshot updates.");
+    println!("     - Training uses continuous learning mask logic (partial branch availability),");
+    println!("       optional EMA based branch selection, replay, and optional autonomous expansion.");
+    println!();
+    println!("  b  Training metrics");
+    println!("     - Prints last training progress snapshot received from training thread.");
+    println!("     - Includes base loss metrics, diagnostic skip counters, and advanced validation metrics.");
+    println!();
+    println!("  s  Stop training");
+    println!("     - Requests cooperative cancellation and joins training thread.");
+    println!("     - Also signals shutdown to online ingestion receiver when present.");
+    println!();
+    println!("  n  Add new training data file (online ingestion)");
+    println!("     - Requires running training thread.");
+    println!("     - Expects a JSON file containing an array of strings (training examples).");
+    println!("     - Data are tokenized and appended to the active training pool (append only).");
+    println!();
+    println!("  l  Load checkpoint (serve model)");
+    println!("     - Loads checkpoint file and rebuilds topology for llm_serve only.");
+    println!("     - Training model instance is not replaced by this action.");
+    println!();
+    println!("  w  Save checkpoint (serve model)");
+    println!("     - Saves tokenizer, topology spec, and all parameters from llm_serve.");
+    println!();
+    println!("  a  Ask (serve model, parallel to training)");
+    println!("     - Interactive inference loop on llm_serve.");
+    println!("     - Reports prediction metrics (throughput, entropy, margin, perplexity proxy).");
+    println!();
+    println!("  o  Toggle outage simulation (serve model, test only)");
+    println!("     - Enables fault injection in ParallelBlockGroup during predict.");
+    println!("     - Drops a randomly chosen branch per predict call for robustness testing.");
+    println!();
+    println!("  y  Topology (ASCII, serve model)");
+    println!("     - Prints layer list and for ParallelBlockGroup also branch layer types.");
+    println!();
+    println!("  x  Metrics (MTB diagnostics, serve model)");
+    println!("     - Runs post load diagnostics on ParallelBlockGroup to quantify path usage and diversity.");
+    println!();
+    println!("  h  Help");
+    println!("     - Prints this help text.");
+    println!();
+    println!("  e  Exit");
+    println!("     - Requests ingestion shutdown, cancels training if running, joins thread, exits program.");
+    println!();
+    println!("Training metrics (printed by command b):");
+    println!("  Base progress fields:");
+    println!("    phase: current phase name (e.g. pretraining, instruction_tuning)");
+    println!("    epoch: current epoch and total epochs");
+    println!("    last_epoch_loss: mean loss of last completed epoch (running mean during epoch in step events)");
+    println!("    last_step_loss: last observed step loss (cross entropy)");
+    println!("    rows_used_last_epoch: number of training rows that produced a valid update");
+    println!("    total_steps: number of successful update steps across epochs");
+    println!();
+    println!("  Diagnostic skip counters:");
+    println!("    skips_empty_act: forward produced empty activations, row skipped");
+    println!("    skips_empty_logits: forward produced empty logits, row skipped");
+    println!("    skips_pg_downcast_failed: ParallelBlockGroup downcast failed, row skipped");
+    println!("    skips_pg_no_branches: ParallelBlockGroup had zero branches, row skipped");
+    println!();
+    println!("  Advanced validation metrics (continuous learning and expandable width):");
+    println!("  (1) Ingestion throughput and queue proxies:");
+    println!("    ingest_rows_per_sec_window: windowed rate of accepted rows added to token pool");
+    println!("    ingest_events_per_sec_window: windowed rate of processed ingestion events");
+    println!("    ingest_rows_added_total: total accepted rows added since start of phase");
+    println!("    ingest_events_processed_total: total processed ingestion events since start of phase");
+    println!("    ingest_parse_errors_total: total parse or tokenization errors during ingestion");
+    println!("    ingest_rows_rejected_total: total rows rejected (empty, too short, over budget)");
+    println!("    ingest_pending_events_observed_peak: coarse proxy for pending events observed during drains");
+    println!();
+    println!("  (2) Coverage ratio (effective data coverage per epoch):");
+    println!("    epoch_token_rows_start: token rows available at epoch start (snapshot length)");
+    println!("    epoch_token_rows_end: token rows available at epoch end (after ingestion)");
+    println!("    new_rows_added_during_epoch: epoch_token_rows_end - epoch_token_rows_start");
+    println!("    coverage_ratio_used_over_available: used_rows / epoch_token_rows_start (approx)");
+    println!("    new_data_ratio_in_available: new_rows_added_during_epoch / epoch_token_rows_end");
+    println!();
+    println!("  (3) Availability mask statistics (participation and sparsity):");
+    println!("    active_branches_mean/std/min/max: statistics of active branches per step");
+    println!("    mask_sparsity_mean/std: fraction of inactive branches per step");
+    println!("    steps_at_min_active_share: share of steps where active branches equal min_active");
+    println!();
+    println!("  (4) Inverse participation scaling impact (unbiasedness proxy):");
+    println!("    grad_norm_ratio_scaled_over_unscaled_mean/std: proxy ratio for gradient magnitude");
+    println!("    grad_norm_scaled_mean/unscaled_mean: proxy means of compared gradient norms");
+    println!("    Note: this implementation uses a lightweight proxy and does not clone full weights.");
+    println!();
+    println!("  (5) Replay usage and replay effect strength:");
+    println!("    replay_share: replay_steps / (fresh_steps + replay_steps)");
+    println!("    replay_p_last: last replay probability used by phase strategy");
+    println!("    replay_delta_loss_mean/std: mean/std of (loss_replay - loss_fresh) pairs");
+    println!();
+    println!("  (6) Forgetting indicator (retention score) on fixed control sets:");
+    println!("    loss_control_old/new: forward only loss on fixed control slices");
+    println!("    retention_delta_old/new: loss_now - loss_baseline (positive indicates forgetting)");
+    println!("    Note: control sets are deterministic slices of initial token pool in this implementation.");
+    println!();
+    println!("  (7) Branch selection fairness and dominance:");
+    println!("    branch_select_gini: Gini coefficient of EMA selection frequencies");
+    println!("    branch_select_top1_share: max selection share across branches");
+    println!("    Interpretation: higher values indicate dominance and possible path starvation.");
+    println!();
+    println!("  (8) Snapshot telemetry (train to serve):");
+    println!("    snapshots_sent_total: count of parameter snapshots sent from training");
+    println!("    Note: latency and staleness require snapshot metadata in payload;");
+    println!("          receiver side must carry send_time_ms and train_step for full measurement.");
+    println!();
+    println!("  (9) Expansion events and injection telemetry:");
+    println!("    expansion_events_total: number of width expansion operations performed");
+    println!("    branches_before_last_expand / branches_after_last_expand: last expansion size");
+    println!("    eta_injection_last: conservative injection parameter used by phase strategy");
+    println!("    sum_w_new_last: approximate total weight mass assigned to new branches (best effort)");
+    println!();
+    println!("  (10) Functional continuity on expansion (output drift proxy):");
+    println!("    expand_drift_logits_l2_mean/std: L2 distance of last step logits before vs after expansion");
+    println!("    expand_drift_logits_cos_dist_mean/std: cosine distance of last step logits before vs after");
+    println!("    Interpretation: smaller values indicate more stable behavior under expansion.");
+    println!();
+    println!("  EMA state:");
+    println!("    ema_active: whether EMA based branch selection is active at current step");
+    println!("    ema_last_selected_branch: last selected branch index (or -1 if not applicable)");
+    println!();
+    println!("Prediction metrics (printed after each ask in interactive mode):");
+    println!("  duration_ms: wall clock time for predict");
+    println!("  generated_tokens: number of output tokens generated (tokenizer based)");
+    println!("  tokens_per_sec: throughput based on generated_tokens and duration");
+    println!("  effective_context_utilization: (input_tokens + output_tokens) / MAX_SEQ_LEN");
+    println!("  avg_selected_token_prob: mean probability of selected token across generation steps");
+    println!("  perplexity_selected: exp(mean(-ln(p_selected))) proxy from selected token probabilities");
+    println!("  avg_next_token_entropy_nat: mean entropy of next token distribution per step (nats)");
+    println!("  avg_top1_top2_margin: mean difference between top1 and top2 probabilities per step");
+    println!();
+    
+}
+
 fn drain_snapshot_updates_non_blocking(
-    opt_rx: &mut Option<mpsc::Receiver<Vec<f32>>>,
-    llm_serve: &Arc<Mutex<Llm>>,
+    opt_rx: &mut Option<std::sync::mpsc::Receiver<Vec<f32>>>,
+    llm_serve: &std::sync::Arc<std::sync::Mutex<crate::layer::Llm>>,
 ) {
+    use std::sync::mpsc;
+
     let rx = match opt_rx.as_mut() {
         Some(r) => r,
         None => return,
     };
 
-    // Always keep only the latest snapshot to minimize work.
     let mut opt_last: Option<Vec<f32>> = None;
 
     loop {
@@ -411,6 +839,9 @@ fn drain_snapshot_updates_non_blocking(
             Err(_) => return,
         };
         let _ = llm.import_parameters_snapshot(&v_params);
+
+        // Minimal: no further metrics possible without snapshot metadata.
+        // Full implementation requires SnapshotPacketAscii as described above.
     }
 }
 
@@ -487,6 +918,7 @@ fn main() {
         println!("  o Toggle outage simulation (serve model, test only)");
         println!("  y Topology (ASCII, serve model)");
         println!("  x Metrics (MTB diagnostics, serve model)");
+        println!("  h Help");
         println!("  e Exit");
 
         print!("\nEnter command: ");
@@ -506,6 +938,7 @@ fn main() {
 
         let s_cmd_lc = s_cmd.to_lowercase();
 
+
         if s_cmd_lc == "e" {
             if let Some(tx) = opt_data_tx.as_ref() {
                 let _ = tx.send(TrainingDataEventAscii::shutdown);
@@ -518,6 +951,10 @@ fn main() {
 
             println!("Exit.");
             break;
+        }
+        if s_cmd_lc == "h" {
+            print_help_ascii();
+            continue;
         }
 
         if s_cmd_lc == "t" {
