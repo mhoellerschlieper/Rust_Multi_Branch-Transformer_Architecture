@@ -2,11 +2,8 @@
 
 Implementation and reference documentation of a **Multi-Branch Transformer Architecture (MBT)** in **Rust**. The focus is on **intra-layer parallelism (width)** with **explicit aggregation**, complemented by a **BPE tokenizer pipeline**, **training/inference**, and **reproducible checkpoints** (tokenizer + parameters) as a closed, analyzable system. The architecture is described to serve as a foundation for **distributed execution** (including P2P topologies) as well as for **fault-tolerant and continuously extensible** transformer systems.
 
-Core Idea: 
-In the present codebase, the Multi-Branch Transformer (MBT) concept is implemented as an explicit width layer (ParallelBlockGroup) that encapsulates a set of branch sub-networks (each branch being either a TransformerBlock or a short TransformerSequence) and produces a single fused activation tensor through a deterministic aggregation step. This design enforces that multi-pathness is not merely an interpretation of residual computation, but a first-class architectural primitive that can be reasoned about, measured, checkpointed, and (conceptually) executed across heterogeneous resources.
-The current implementation supports uniform averaging as a default aggregation, as well as an extended mode with explicit branch weights that can be renormalized over an availability mask (for outages or partial participation). Crucially, the aggregation is the natural governance interface of the system: it is the point where branch weighting, masking, fairness constraints, and robustness policies can be applied without changing branch internals.
+<img width="392" height="995" alt="grafik" src="https://github.com/user-attachments/assets/bc7ae7ee-03fd-4391-addf-42393690a981" />
 
-<img width="448" height="692" alt="grafik" src="https://github.com/user-attachments/assets/1ae1d876-6ae2-4246-a80e-1578d7f74722" />
 
 
 ## Contents
@@ -317,6 +314,7 @@ See `LICENSE` in the repository.
 - Related implementations/references (project environment):
   - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
   - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
+
 
 
 
