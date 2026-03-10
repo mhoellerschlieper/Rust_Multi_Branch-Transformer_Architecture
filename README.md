@@ -162,11 +162,8 @@ Benchmark with and without outage simulation
 
 The multi-branch structure is modeled such that **one path** can serve as a **partition unit** mapped to different nodes, while an aggregation instance fuses the path outputs. For fault tolerance, a masking variable \(m_i^{(l)} \in \{0,1\}\) is used; weights are renormalized in the event of failure:
 
-\[
-\tilde{\alpha}_i^{(l)} = \frac{m_i^{(l)} \alpha_i^{(l)}}{\sum_{j=1}^{K} m_j^{(l)} \alpha_j^{(l)}} \quad (\text{if denominator} &gt; 0),
-\quad
-\tilde{h}^{(l+1)} = \sum_{i=1}^{K} \tilde{\alpha}_i^{(l)} z_i^{(l)}.
-\]
+<img width="1019" height="51" alt="grafik" src="https://github.com/user-attachments/assets/d97d7665-a9a7-4de7-bfd2-8b16174ef358" />
+
 
 Thus, the layer function remains well-defined as long as at least one path is available. In P2P settings, quorum/timeout policies and anti-weight-collapse rules are methodologically central to limit tail latency and single-point-of-failure effects.
 
@@ -314,6 +311,7 @@ See `LICENSE` in the repository.
 - Related implementations/references (project environment):
   - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
   - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
+
 
 
 
